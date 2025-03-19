@@ -1,0 +1,8 @@
+Cargo.lock
+
+**/target
+
+perf.data*
+
+*.svg
+*.txt

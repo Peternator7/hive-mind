@@ -29,7 +29,8 @@ impl Board {
         let mut idx: usize = 0;
         let mut num_zeros = 0;
         let mut processing_stacked_beetle = false;
-        for ch in text.chars() {
+        let mut chars = text.chars();
+        while let Some(ch) = chars.next() {
             match ch {
                 '[' => {
                     processing_stacked_beetle = true;
@@ -49,9 +50,15 @@ impl Board {
                         num_zeros = 0;
                     }
 
-                    let Some(p) = Piece::from_char(ch) else {
+                    let Some(id) = chars.next() else {
                         return Err(HiveError::DeserializationError(
-                            DeserializationError::InvalidChar(ch),
+                            DeserializationError::EndOfStream,
+                        ));
+                    };
+
+                    let Some(p) = Piece::from_char_pair(ch, id) else {
+                        return Err(HiveError::DeserializationError(
+                            DeserializationError::InvalidChar(ch, id),
                         ));
                     };
 
@@ -88,26 +95,31 @@ impl Board {
 
         for (idx, line) in lines.iter().enumerate() {
             for (col, value) in line.split(' ').enumerate() {
-                for c in value.chars() {
-                    if c == '.' {
-                        continue;
+                if value == "." {
+                    continue;
+                }
+
+                let Some(piece) = Piece::from_str(value) else {
+                    let mut chars = value.chars();
+                    let c1 = chars.next();
+                    let mut c2 = ' ';
+                    if c1.is_some() {
+                        c2 = chars.next().unwrap_or('?');
                     }
 
-                    let Some(piece) = Piece::from_char(c) else {
-                        return Err(HiveError::DeserializationError(
-                            DeserializationError::InvalidChar(c),
-                        ));
-                    };
+                    return Err(HiveError::DeserializationError(
+                        DeserializationError::InvalidChar(c1.unwrap_or('?'), c2),
+                    ));
+                };
 
-                    board.internal_place_piece(
-                        piece,
-                        Position(idx as u8, col as u8),
-                        false,
-                        piece.is_beetle(),
-                    )?;
+                board.internal_place_piece(
+                    piece,
+                    Position(idx as u8, col as u8),
+                    false,
+                    piece.is_beetle(),
+                )?;
 
-                    board.pieces_on_board.set(board.pieces_on_board.get() + 1);
-                }
+                board.pieces_on_board.set(board.pieces_on_board.get() + 1);
             }
         }
 

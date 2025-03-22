@@ -1,4 +1,3 @@
-
 use std::{
     error::Error,
     fmt::{Display, Formatter},
@@ -100,13 +99,17 @@ impl Display for ValidationError {
 /// This error is used when an invalid character is encountered during the deserialization process.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum DeserializationError {
-    InvalidChar(char),
+    EndOfStream,
+    InvalidChar(char, char),
 }
 
 impl Display for DeserializationError {
     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         match self {
-            DeserializationError::InvalidChar(c) => write!(f, "InvalidChar({})", c),
+            DeserializationError::InvalidChar(role, id) => {
+                write!(f, "InvalidChar({},{})", role, id)
+            }
+            DeserializationError::EndOfStream => write!(f, "EndOfStream"),
         }
     }
 }

@@ -85,6 +85,7 @@ impl Board {
                 piece: Piece {
                     role: Insect::Beetle,
                     color: Color::White,
+                    id: Default::default(),
                 },
                 next: None,
             },
@@ -104,6 +105,10 @@ impl Board {
             pieces_on_board: Default::default(),
             needs_frozen_refresher: Cell::new(false),
         }
+    }
+
+    pub fn dims(&self) -> usize {
+        self.dim as usize
     }
 
     pub fn frozenness(&self) -> FrozenMap {
@@ -841,6 +846,7 @@ mod tests {
             Piece {
                 role: Insect::Grasshopper,
                 color: Color::Black,
+                id: Default::default(),
             },
             x,
         )
@@ -874,6 +880,7 @@ mod tests {
                 Piece {
                     role: Insect::Spider,
                     color: Color::White,
+                    id: Default::default(),
                 },
                 position,
             )?;
@@ -888,6 +895,7 @@ mod tests {
                 Piece {
                     role: Insect::QueenBee,
                     color: Color::Black,
+                    id: Default::default(),
                 },
                 position,
             )?;

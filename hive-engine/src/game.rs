@@ -47,6 +47,10 @@ impl Game {
         }
     }
 
+    pub fn dims(&self) -> usize {
+        self.board.dims()
+    }
+
     pub fn is_game_is_over(&self) -> Option<GameWinner> {
         self.winner
     }
@@ -89,9 +93,15 @@ impl Game {
         color: Color,
     ) -> impl Iterator<Item = Piece> + 'a {
         Insect::iter()
-            .filter(move |insect| self.hands.get(color).has_insect(*insect))
-            .map(move |insect| Piece {
+            .filter_map(move |insect| {
+                self.hands
+                    .get(color)
+                    .next_insect_id(insect)
+                    .map(|id| (id, insect))
+            })
+            .map(move |(id, insect)| Piece {
                 role: insect,
+                id,
                 color,
             })
     }
@@ -122,6 +132,44 @@ impl Game {
 
     pub fn enumerate_valid_moves<'a>(&'a self, pos: Position) -> Result<PieceMovements<'a>> {
         self.board.enumerate_valid_moves(pos)
+    }
+
+    pub fn load_all_potential_moves(&self, dst: &mut Vec<Move>) -> Result<()> {
+        let to_play = self.to_play();
+        let turn = self.turn();
+
+        let queen_in_hand = self.hand(to_play).has_queen();
+        let can_move = !queen_in_hand;
+        let can_play_queen = turn > 1;
+        let must_play_queen = turn == 4 && queen_in_hand;
+
+        for piece in self.enumerate_playable_pieces_from_hand(to_play) {
+            if !can_play_queen && piece.is_queen() {
+                continue;
+            }
+
+            if must_play_queen && !piece.is_queen() {
+                continue;
+            }
+
+            for position in self.enumerate_playable_positions(to_play) {
+                let mv = Move::PlacePiece { piece, position };
+                dst.push(mv)
+            }
+        }
+
+        if !can_move {
+            return Ok(());
+        }
+
+        for (piece, from) in self.enumerate_free_pieces(to_play) {
+            for to in self.enumerate_valid_moves(from)? {
+                let mv = Move::MovePiece { piece, from, to };
+                dst.push(mv);
+            }
+        }
+
+        Ok(())
     }
 
     pub fn make_move(&mut self, mv: Move) -> Result<()> {
@@ -295,6 +343,7 @@ mod tests {
             piece: Piece {
                 role: Insect::SoldierAnt,
                 color: Color::White,
+                id: 0,
             },
             position: Position(16, 16),
         })
@@ -306,6 +355,7 @@ mod tests {
             piece: Piece {
                 role: Insect::Beetle,
                 color: Color::Black,
+                id: 0,
             },
             position: Position(16, 15),
         })
@@ -317,6 +367,7 @@ mod tests {
             piece: Piece {
                 role: Insect::SoldierAnt,
                 color: Color::White,
+                id: 0,
             },
             from: Position(16, 16),
             to: Position(16, 14),
@@ -329,6 +380,7 @@ mod tests {
             piece: Piece {
                 role: Insect::Beetle,
                 color: Color::Black,
+                id: 0,
             },
             from: Position(16, 15),
             to: Position(16, 14),

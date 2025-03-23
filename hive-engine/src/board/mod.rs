@@ -28,7 +28,6 @@ use crate::{
     Result,
 };
 
-const BOARD_SIZE: u8 = 32;
 pub static RECALCULATE_SKIPPED: AtomicUsize = AtomicUsize::new(0);
 pub static RECALCULATE_REQUIRED: AtomicUsize = AtomicUsize::new(0);
 
@@ -695,12 +694,13 @@ impl Board {
     }
 
     fn convert_coords_to_idx(x: u8, y: u8, dim: u8) -> usize {
-        y as usize * dim as usize + x as usize
+
+        x as usize * dim as usize + y as usize
     }
 
     fn convert_idx_to_coords(idx: usize, dim: u8) -> Position {
-        let y = idx / dim as usize;
-        let x = idx % dim as usize;
+        let x = idx / dim as usize;
+        let y = idx % dim as usize;
 
         Position(x as u8, y as u8)
     }
@@ -708,7 +708,7 @@ impl Board {
 
 impl Default for Board {
     fn default() -> Self {
-        Board::new(BOARD_SIZE)
+        Board::new(crate::BOARD_SIZE)
     }
 }
 

@@ -1,7 +1,8 @@
 [workspace]
 resolver = "2"
 members = [
-    "hive-engine"
+    "hive-engine",
+    "hive-ml"
 ]
 
 [profile.release]

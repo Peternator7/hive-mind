@@ -8,3 +8,5 @@ pub mod piece;
 pub mod position;
 
 pub type Result<T> = std::result::Result<T, error::HiveError>;
+
+pub const BOARD_SIZE: u8 = 32;

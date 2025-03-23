@@ -1,0 +1,2 @@
+pub const INPUT_ENCODED_DIMS: usize = 2 * 11 + (2 * 4); // 11 pieces, 4 levels of beetle stacking.
+pub const OUTPUT_LENGTH: usize = 11 * hive_engine::BOARD_SIZE as usize * hive_engine::BOARD_SIZE as usize;

@@ -1,128 +1,195 @@
 use std::collections::HashMap;
+use std::error::Error;
+use std::sync::atomic::AtomicUsize;
+use std::sync::Mutex;
 use std::time::Instant;
 
+use crate::model::HiveModel;
+
+use hive_engine::error::HiveError;
 use hive_engine::game::GameWinner;
 use hive_engine::movement::Move;
 use hive_engine::BOARD_SIZE;
 use hive_engine::{game::Game, piece::Color};
-use hive_ml::hypers::{self, INPUT_ENCODED_DIMS, OUTPUT_LENGTH};
+use hive_ml::frames::{MultipleGames, SingleGame};
+use hive_ml::hypers::{self, BATCH_SIZE, INPUT_ENCODED_DIMS, OUTPUT_LENGTH};
 use hive_ml::{translate_to_tensor, PieceEncodable};
-use tch::kind::FLOAT_CPU;
-use tch::nn::{OptimizerConfig, VarStore};
-use tch::{nn, Kind, Tensor};
+use tch::nn::{Optimizer, OptimizerConfig, VarStore};
+use tch::{nn, IndexOp, Kind, Tensor};
 
 // input data shape should be [batch, channels, rows, cols]
 // output data shape should be [batch, ]
 
-pub struct HiveModel {
-    shared_layers: tch::nn::Sequential,
-    policy_layer: tch::nn::Sequential,
-    value_layer: tch::nn::Sequential,
-    device: tch::Device,
-}
-struct GameFrame {
-    playing: Color,
-    game_state: Tensor,
-    /// A 1x1 tensor that contains the index sampled by the policy.
-    selected_policy: Tensor,
-    /// A mask that represents the actions that are invalid in the current state.
-    invalid_move_mask: Tensor,
-    /// A tensor that represents the rewards we got from making this decision.
-    /// Not time discounted.
-    future_value: Tensor,
-    time_adjusted_value: Tensor,
+mod model;
+
+pub fn gae(v: &[f64], lambda: f64, gamma: f64) -> Tensor {
+    let mut advantages = vec![0.0; v.len()];
+    let mut gae = 0.0;
+    for t in (0..v.len() - 1).rev() {
+        let delta = v[t] + gamma * v[t + 1] - v[t];
+        gae = delta + gamma * lambda * gae;
+        advantages[t] = gae;
+    }
+
+    Tensor::from_slice(&advantages)
 }
 
-impl HiveModel {
-    pub fn new(p: &nn::Path) -> Self {
-        let stride = |s| nn::ConvConfig {
-            stride: s,
-            ..Default::default()
-        };
-
-        let shared_layers = nn::seq()
-            .add(nn::conv2d(
-                p / "c1",
-                INPUT_ENCODED_DIMS as i64,
-                32,
-                3,
-                Default::default(),
-            ))
-            .add_fn(|xs| xs.relu())
-            .add(nn::conv2d(p / "c2", 32, 64, 4, stride(2)))
-            .add_fn(|xs| xs.relu())
-            .add(nn::conv2d(p / "c3", 64, 64, 3, stride(2)))
-            .add_fn(|xs| xs.relu().flat_view())
-            .add(nn::linear(p / "l1", 2304, 512, Default::default()))
-            .add_fn(|xs| xs.relu());
-
-        let value_layer = nn::seq()
-            .add(nn::linear(p / "c1", 512, 1, Default::default()))
-            .add_fn(|xs| 2 * xs.sigmoid() - 1.0);
-
-        let policy_layer = nn::seq().add(nn::linear(
-            p / "al",
-            512,
-            OUTPUT_LENGTH as i64,
-            Default::default(),
-        ));
-
-        let device = p.device();
-
-        Self {
-            shared_layers,
-            policy_layer,
-            value_layer,
-            device,
-        }
-    }
-
-    pub fn value_policy(&self, game_state: &Tensor) -> (Tensor, Tensor) {
-        let t = self.shared_layers(game_state);
-        (t.apply(&self.value_layer), t.apply(&self.policy_layer))
-    }
-
-    pub fn value(&self, game_state: &Tensor) -> Tensor {
-        let t = self.shared_layers(game_state);
-        t.apply(&self.value_layer)
-    }
-
-    pub fn policy(&self, game_state: &Tensor) -> Tensor {
-        let t = self.shared_layers(game_state);
-        t.apply(&self.policy_layer)
-    }
-
-    fn shared_layers(&self, game_state: &Tensor) -> Tensor {
-        game_state.apply(&self.shared_layers)
-    }
-}
-
-pub fn main() -> hive_engine::Result<()> {
+pub fn main() -> Result<(), Box<dyn Error>> {
     let device = tch::Device::cuda_if_available();
+
     let vs = nn::VarStore::new(device);
-    let mut model = HiveModel::new(&vs.root());
+    let model = Mutex::new(HiveModel::new(&vs.root()));
+    let mut adam = nn::Adam::default().build(&vs, 5e-4).unwrap();
 
-    let mut buffer = Vec::new();
-    for _ in 0..100 {
-        let mut g = Game::new();
+    vs.save("models/initial.weights")?;
 
+    let frames = Mutex::new(MultipleGames::default());
+    for epoch in 1..100 {
         let st = Instant::now();
-        play_game_to_end(&mut g, &model, &mut buffer)?;
+        let games_played = &AtomicUsize::new(0);
+        let games_stalled = &AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            let handles = (0..hypers::PARALLEL_GAMES)
+                .map(|_| {
+                    let white_model = &model;
+                    let black_model = &model;
+                    scope.spawn(|| {
+                        let samples = &mut SingleGame::default();
+                        assert!(samples.validate_buffers());
+                        samples.clear();
+                        while frames.lock().unwrap().len() < hypers::TARGET_FRAMES_PER_BATCH {
+                            let mut game = Game::new();
+                            games_played.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+                            let winner = match play_game_to_end(
+                                &mut game,
+                                white_model,
+                                black_model,
+                                samples,
+                            ) {
+                                Ok(winner) => winner,
+                                Err(HiveError::TurnLimitHit) => {
+                                    samples.clear();
+                                    games_stalled
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    continue;
+                                }
+                                Err(e) => return Err(e),
+                            };
+
+                            let mut frames = frames.lock().unwrap();
+                            if frames.len() < hypers::TARGET_FRAMES_PER_BATCH {
+                                frames.ingest_game(samples, winner, hypers::GAMMA, hypers::LAMBDA);
+                            } else {
+                                break;
+                            }
+                        }
+
+                        Result::<_, HiveError>::Ok(())
+                    })
+                })
+                .collect::<Vec<_>>();
+
+            for handle in handles {
+                match handle.join() {
+                    Ok(result) => result?,
+                    Err(err) => std::panic::resume_unwind(err),
+                }
+            }
+
+            Result::<(), HiveError>::Ok(())
+        })?;
+
+        let mut frames = frames.lock().unwrap();
         println!(
-            "Game Over, Turns: {}, Time Taken: {}s",
-            g.turn(),
-            (Instant::now() - st).as_secs_f32()
+            "Played Games: {}, Stalled Games: {}, Time Taken: {}s, Frame Count: {}",
+            games_played.load(std::sync::atomic::Ordering::Relaxed),
+            games_stalled.load(std::sync::atomic::Ordering::Relaxed),
+            (Instant::now() - st).as_secs_f32(),
+            frames.len(),
         );
 
         // Do a training loop.
         let st = Instant::now();
-        _train_loop(&vs, &mut model, buffer.as_slice());
+        _train_loop(&mut adam, &mut *model.lock().unwrap(), &*frames);
         println!(
-            "Training Iteration Complete, Time Taken: {}s",
+            "Epoch: {}, Training Iteration Complete, Time Taken: {}s",
+            epoch,
             (Instant::now() - st).as_secs_f32()
         );
 
-        buffer.clear();
+        frames.clear();
+
+        vs.save(format!("models/epoch_{0}", epoch))?;
+
+        if epoch % 10 == 0 {
+            println!("Test against random model...");
+
+            let mut old_vs = VarStore::new(device);
+            let old_model = Mutex::new(HiveModel::new(&old_vs.root()));
+            old_vs.load("models/initial.weights")?;
+
+            let st = Instant::now();
+            let games_played = &AtomicUsize::new(0);
+            let white_won = &AtomicUsize::new(0);
+            let black_won = &AtomicUsize::new(0);
+            let drawn = &AtomicUsize::new(0);
+
+            std::thread::scope(|scope| {
+                let handles = (0..hypers::PARALLEL_GAMES)
+                    .map(|_| {
+                        scope.spawn(|| {
+                            let mut last_iter_failed = false;
+                            while last_iter_failed
+                                || games_played.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                                    < hypers::GAMES_PER_AI_SIMULATION
+                            {
+                                last_iter_failed = false;
+                                let mut game = Game::new();
+                                let samples = &mut Default::default();
+                                match play_game_to_end(&mut game, &model, &old_model, samples) {
+                                    Ok(None) => {
+                                        drawn.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    }
+                                    Ok(Some(Color::White)) => {
+                                        white_won
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    }
+                                    Ok(Some(Color::Black)) => {
+                                        black_won
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    }
+                                    Err(HiveError::TurnLimitHit) => {
+                                        last_iter_failed = true;
+                                        continue;
+                                    }
+                                    Err(e) => return Err(e),
+                                }
+                            }
+
+                            Result::<_, HiveError>::Ok(())
+                        })
+                    })
+                    .collect::<Vec<_>>();
+
+                for handle in handles {
+                    match handle.join() {
+                        Ok(result) => result?,
+                        Err(err) => std::panic::resume_unwind(err),
+                    }
+                }
+
+                Result::<(), HiveError>::Ok(())
+            })?;
+
+            println!(
+                "Vs Random, Wins (new): {}, Wins (random): {}, Ties: {}, Time: {}s",
+                white_won.load(std::sync::atomic::Ordering::Relaxed),
+                black_won.load(std::sync::atomic::Ordering::Relaxed),
+                drawn.load(std::sync::atomic::Ordering::Relaxed),
+                (Instant::now() - st).as_secs_f32(),
+            );
+        }
     }
 
     Ok(())
@@ -130,17 +197,31 @@ pub fn main() -> hive_engine::Result<()> {
 
 fn play_game_to_end(
     g: &mut Game,
-    model: &HiveModel,
-    samples: &mut Vec<GameFrame>,
-) -> hive_engine::Result<()> {
+    white_model: &Mutex<HiveModel>,
+    black_model: &Mutex<HiveModel>,
+    samples: &mut SingleGame,
+) -> hive_engine::Result<Option<Color>> {
     let mut consecutive_passes = 0;
-
     let mut valid_moves = Vec::new();
-
     let mut invalid_moves_mask = vec![true; OUTPUT_LENGTH];
-
     let mut winner = None;
     loop {
+        let model = if g.to_play() == Color::White {
+            white_model
+        } else {
+            black_model
+        };
+
+        if g.turn() == hypers::MAX_TURNS_PER_GAME {
+            return Err(HiveError::TurnLimitHit);
+        }
+
+        if samples.game_state.len() > 2000 {
+            panic!("{}", g.turn());
+        }
+
+        let device = model.lock().unwrap().device;
+
         if let Some(result) = g.is_game_is_over() {
             if let GameWinner::Winner(color) = result {
                 winner = Some(color);
@@ -168,12 +249,15 @@ fn play_game_to_end(
 
         let playing = g.to_play();
         let curr_state = translate_to_tensor(&g, playing);
-        let curr_state_batch = curr_state.view((
-            1,
-            INPUT_ENCODED_DIMS as i64,
-            BOARD_SIZE as i64,
-            BOARD_SIZE as i64,
-        ));
+        let curr_state_batch = curr_state
+            .view((
+                1,
+                INPUT_ENCODED_DIMS as i64,
+                BOARD_SIZE as i64,
+                BOARD_SIZE as i64,
+            ))
+            .to(device);
+
         let mut map = HashMap::new();
 
         for mv in &valid_moves {
@@ -194,114 +278,35 @@ fn play_game_to_end(
 
         let invalid_moves_tensor = Tensor::from_slice(&invalid_moves_mask);
 
-        let (value, mut policy) = tch::no_grad(|| model.value_policy(&curr_state_batch));
+        let (value, mut policy) =
+            tch::no_grad(|| model.lock().unwrap().value_policy(&curr_state_batch));
 
-        let _ = policy.masked_fill_(&invalid_moves_tensor, f64::NEG_INFINITY);
+        let _ = policy.masked_fill_(&invalid_moves_tensor.to(device), f64::NEG_INFINITY);
 
         let sampled_action_idx = policy.softmax(-1, None).multinomial(1, true);
         let action_prob: i64 = i64::try_from(&sampled_action_idx).expect("cast");
         let mv = map.get(&(action_prob as usize)).expect("populated above.");
         g.make_move(**mv)?;
 
-        samples.push(GameFrame {
-            playing,
-            game_state: curr_state,
-            invalid_move_mask: invalid_moves_tensor,
-            future_value: value.view(1i64),
-            time_adjusted_value: value.view(1i64),
-            selected_policy: sampled_action_idx.view(()),
-        });
+        samples.playing.push(playing);
+        samples.game_state.push(curr_state);
+        samples.invalid_move_mask.push(invalid_moves_tensor);
+        samples.value.push(value.view(1i64).to(tch::Device::Cpu));
+        samples
+            .selected_policy
+            .push(sampled_action_idx.view(1i64).to(tch::Device::Cpu));
     }
 
-    const MAX_TD_DISTANCE: usize = 10;
-    let gamma = Tensor::from(0.99f32);
-    let max_decay_gamma = &gamma.pow_tensor_scalar(MAX_TD_DISTANCE as i64);
-
-    let final_score = match winner {
-        Some(..) => &Tensor::from(0.5f32),
-        None => &Tensor::from(0.0f32),
-    };
-
-    let num_samples = samples.len();
-    for idx in 0..num_samples {
-        if idx + MAX_TD_DISTANCE < num_samples {
-            // Use the value estimate as the target.
-            let future_frame = &samples[idx + MAX_TD_DISTANCE];
-            let future_color = future_frame.playing;
-            let mut future_score = future_frame.future_value.copy();
-
-            let sample = &mut samples[idx];
-            sample.future_value = if future_color != sample.playing {
-                future_score.neg_()
-            } else {
-                future_score
-            };
-
-            sample.time_adjusted_value = sample.future_value.multiply(max_decay_gamma);
-        } else {
-            // use the true value as the target.
-            let decay_factor = (num_samples - idx - 1) as i64;
-            let decay_factor = gamma.pow_tensor_scalar(decay_factor);
-            let mut future_score = final_score.copy();
-
-            let sample = &mut samples[idx];
-
-            sample.future_value = if winner != Some(sample.playing) {
-                // If the result was a draw, then we'll just have -0.0 which is still fine.
-                future_score.neg_()
-            } else {
-                future_score
-            };
-
-            sample.time_adjusted_value = sample.future_value.multiply(&decay_factor);
-        }
-    }
-
-    Ok(())
+    Ok(winner)
 }
 
-fn _train_loop(vs: &VarStore, model: &mut HiveModel, frames: &[GameFrame]) {
-    let mut adam = nn::Adam::default().build(vs, 1e-4).unwrap();
+fn _train_loop(adam: &mut Optimizer, model: &mut HiveModel, frames: &MultipleGames) {
 
-    let options = (tch::Kind::Float, model.device);
-    let mut state_buffer = {
-        let mut state_buffer_shape = vec![frames.len() as i64];
-        state_buffer_shape.extend_from_slice(frames[0].game_state.size().as_slice());
-        Tensor::zeros(state_buffer_shape, options)
-    };
-
-    let mut mask_buffer = Tensor::zeros(
-        [frames.len() as i64, hypers::OUTPUT_LENGTH as i64],
-        (tch::Kind::Bool, model.device),
-    );
-    let mut selections_buffer = Tensor::zeros(
-        [frames.len() as i64, 1 as i64],
-        (tch::Kind::Int64, model.device),
-    );
-
-    // The target value is used by the value loss to compute the mse between the value function and the
-    // correct value.
-    let mut target_values_buffer = Tensor::zeros([frames.len() as i64, 1], options);
-
-    // The future value is used by the policy loss to compute the advantage adv = value_fut - value_pres
-    let mut future_values_buffer = Tensor::zeros([frames.len() as i64, 1], options);
-
-    for (idx, frame) in frames.iter().enumerate() {
-        let idx = idx as i64;
-        let _ = state_buffer.index_put_(&[Some(Tensor::from(idx))], &frame.game_state, false);
-        let _ = mask_buffer.index_put_(&[Some(Tensor::from(idx))], &frame.invalid_move_mask, false);
-        let _ = target_values_buffer.index_put_(
-            &[Some(Tensor::from(idx))],
-            &frame.time_adjusted_value,
-            false,
-        );
-
-        let _ =
-            future_values_buffer.index_put_(&[Some(Tensor::from(idx))], &frame.future_value, false);
-
-        let _ =
-            selections_buffer.index_put_(&[Some(Tensor::from(idx))], &frame.selected_policy, false);
-    }
+    let state_buffer = Tensor::stack(frames.game_state.as_slice(), 0).to(model.device);
+    let mask_buffer = Tensor::stack(frames.invalid_move_mask.as_slice(), 0).to(model.device);
+    let selections_buffer = Tensor::stack(frames.selected_policy.as_slice(), 0).to(model.device);
+    let gae_buffer = Tensor::stack(frames.gae.as_slice(), 0).to(model.device);
+    let target_value_buffer = Tensor::stack(frames.target_value.as_slice(), 0).to(model.device);
 
     let logp_old = tch::no_grad(|| model.policy(&state_buffer))
         .masked_fill_(&mask_buffer, f64::NEG_INFINITY)
@@ -309,35 +314,64 @@ fn _train_loop(vs: &VarStore, model: &mut HiveModel, frames: &[GameFrame]) {
         .gather(1, &selections_buffer, false);
 
     let clip_ratio = 0.1f64;
-    let value_policy_learning_ratio = 0.1f64;
-    for _ in 0..6 {
-        adam.zero_grad();
-        let idxs = Tensor::randint(frames.len() as i64, &[64i64], (Kind::Int64, model.device));
-        let states = state_buffer.index_select(0, &idxs);
-        let (values, mut policies) = model.value_policy(&states);
 
-        let adv = future_values_buffer.index_select(0, &idxs) - &values;
+    let mut batch_count = 0;
+    let mut total_value_loss = Tensor::zeros(1, (Kind::Float, model.device));
+    let mut total_value_count = 0;
+    for _ in 0..hypers::TRAIN_ITERS_PER_BATCH {
+        batch_count += 1;
+        let perms = Tensor::randperm(frames.len() as i64, (Kind::Int64, model.device));
+        let mut should_stop_early = false;
 
-        let logp = policies
-            .masked_fill_(&mask_buffer.index_select(0, &idxs), f64::NEG_INFINITY)
-            .log_softmax(1, None)
-            .gather(1, &selections_buffer.index_select(0, &idxs), false);
+        for start in (0..frames.len()).step_by(hypers::BATCH_SIZE) {
+            adam.zero_grad();
+            let upper = frames.len().min(start + BATCH_SIZE) as i64;
+            let idxs = perms.i((start as i64)..upper);
 
-        let logp_old = logp_old.index_select(0, &idxs);
+            let states = state_buffer.index_select(0, &idxs);
+            let (values, mut policies) = model.value_policy(&states);
 
-        let ratio = (logp - logp_old).exp_();
-        let clip_adv = ratio.clamp(1.0 - clip_ratio, 1.0 + clip_ratio) * &adv;
-        let pi_loss = -(ratio * adv).minimum(&clip_adv).mean(None);
+            let adv = gae_buffer.index_select(0, &idxs);
 
-        let value_loss = (values - target_values_buffer.index_select(0, &idxs))
-            .square()
-            .mean(None);
+            let logp = policies
+                .masked_fill_(&mask_buffer.index_select(0, &idxs), f64::NEG_INFINITY)
+                .log_softmax(1, None)
+                .gather(1, &selections_buffer.index_select(0, &idxs), false);
 
-        let loss = value_policy_learning_ratio * value_loss + pi_loss;
+            let logp_old = logp_old.index_select(0, &idxs);
 
-        loss.backward();
-        adam.step();
+            let ratio = (&logp - &logp_old).exp_();
+            let clip_adv = ratio.clamp(1.0 - clip_ratio, 1.0 + clip_ratio) * &adv;
+            let pi_loss = (ratio * adv).minimum(&clip_adv).mean(None).neg();
+
+            let approx_kl: f32 = (logp_old - logp)
+                .mean(None)
+                .abs()
+                .try_into()
+                .expect("success");
+
+            if approx_kl > hypers::CUTOFF_KL {
+                should_stop_early = true;
+            }
+
+            let value_loss = (values - target_value_buffer.index_select(0, &idxs))
+                .square()
+                .mean(None);
+
+            total_value_loss = tch::no_grad(|| total_value_loss + &value_loss);
+            total_value_count += 1;
+            let loss: Tensor = value_loss + (0.5 * pi_loss);
+
+            loss.backward();
+            adam.step();
+        }
+
+        if should_stop_early {
+            println!("Ended training after {} iters", batch_count);
+            break;
+        }
     }
 
+    (total_value_loss / total_value_count).print();
     adam.zero_grad();
 }

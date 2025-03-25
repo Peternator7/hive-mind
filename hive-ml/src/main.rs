@@ -4,42 +4,28 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::Mutex;
 use std::time::Instant;
 
-use crate::model::HiveModel;
-
 use hive_engine::error::HiveError;
 use hive_engine::game::GameWinner;
 use hive_engine::movement::Move;
 use hive_engine::BOARD_SIZE;
 use hive_engine::{game::Game, piece::Color};
-use hive_ml::frames::{MultipleGames, SingleGame};
-use hive_ml::hypers::{self, BATCH_SIZE, INPUT_ENCODED_DIMS, OUTPUT_LENGTH};
-use hive_ml::{translate_to_tensor, PieceEncodable};
+use hive_ml::{
+    frames::{MultipleGames, SingleGame},
+    hypers::{self},
+    model::HiveModel,
+    translate_to_tensor, PieceEncodable,
+};
 use tch::nn::{Optimizer, OptimizerConfig, VarStore};
 use tch::{nn, IndexOp, Kind, Tensor};
 
 // input data shape should be [batch, channels, rows, cols]
 // output data shape should be [batch, ]
 
-mod model;
-
-pub fn gae(v: &[f64], lambda: f64, gamma: f64) -> Tensor {
-    let mut advantages = vec![0.0; v.len()];
-    let mut gae = 0.0;
-    for t in (0..v.len() - 1).rev() {
-        let delta = v[t] + gamma * v[t + 1] - v[t];
-        gae = delta + gamma * lambda * gae;
-        advantages[t] = gae;
-    }
-
-    Tensor::from_slice(&advantages)
-}
-
 pub fn main() -> Result<(), Box<dyn Error>> {
     let device = tch::Device::cuda_if_available();
 
     let vs = nn::VarStore::new(device);
     let model = Mutex::new(HiveModel::new(&vs.root()));
-    let mut adam = nn::Adam::default().build(&vs, 5e-4).unwrap();
 
     vs.save("models/initial.weights")?;
 
@@ -47,6 +33,8 @@ pub fn main() -> Result<(), Box<dyn Error>> {
     for epoch in 1..100 {
         let st = Instant::now();
         let games_played = &AtomicUsize::new(0);
+        let games_finished = &AtomicUsize::new(0);
+        let games_total_length = &AtomicUsize::new(0);
         let games_stalled = &AtomicUsize::new(0);
         std::thread::scope(|scope| {
             let handles = (0..hypers::PARALLEL_GAMES)
@@ -77,12 +65,16 @@ pub fn main() -> Result<(), Box<dyn Error>> {
                                 Err(e) => return Err(e),
                             };
 
+                            games_finished.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            games_total_length.fetch_add(game.turn(), std::sync::atomic::Ordering::Relaxed);
                             let mut frames = frames.lock().unwrap();
-                            if frames.len() < hypers::TARGET_FRAMES_PER_BATCH {
-                                frames.ingest_game(samples, winner, hypers::GAMMA, hypers::LAMBDA);
-                            } else {
-                                break;
-                            }
+                            frames.ingest_game(
+                                samples,
+                                winner,
+                                hypers::GAMMA,
+                                hypers::LAMBDA,
+                                hypers::MAX_FRAMES_PER_GAME,
+                            );
                         }
 
                         Result::<_, HiveError>::Ok(())
@@ -101,9 +93,14 @@ pub fn main() -> Result<(), Box<dyn Error>> {
         })?;
 
         let mut frames = frames.lock().unwrap();
+        let total_len = games_total_length.load(std::sync::atomic::Ordering::Relaxed);
+        let finished = games_finished.load(std::sync::atomic::Ordering::Relaxed);
+
         println!(
-            "Played Games: {}, Stalled Games: {}, Time Taken: {}s, Frame Count: {}",
+            "Total Games: {}, Finished: {}, Avg. Turns: {}, Stalled: {}, Avg  Time: {}s, Frame Count: {}",
             games_played.load(std::sync::atomic::Ordering::Relaxed),
+            finished,
+            total_len as f32 / finished as f32,
             games_stalled.load(std::sync::atomic::Ordering::Relaxed),
             (Instant::now() - st).as_secs_f32(),
             frames.len(),
@@ -111,6 +108,12 @@ pub fn main() -> Result<(), Box<dyn Error>> {
 
         // Do a training loop.
         let st = Instant::now();
+
+        // Create a new optimizer each epoch to avoid momentum carrying over inappropriate
+        // from batch to batch.
+        let mut adam = nn::Adam::default()
+            .build(&vs, hypers::LEARNING_RATE)
+            .unwrap();
         _train_loop(&mut adam, &mut *model.lock().unwrap(), &*frames);
         println!(
             "Epoch: {}, Training Iteration Complete, Time Taken: {}s",
@@ -203,7 +206,7 @@ fn play_game_to_end(
 ) -> hive_engine::Result<Option<Color>> {
     let mut consecutive_passes = 0;
     let mut valid_moves = Vec::new();
-    let mut invalid_moves_mask = vec![true; OUTPUT_LENGTH];
+    let mut invalid_moves_mask = vec![true; hypers::OUTPUT_LENGTH];
     let mut winner = None;
     loop {
         let model = if g.to_play() == Color::White {
@@ -216,7 +219,7 @@ fn play_game_to_end(
             return Err(HiveError::TurnLimitHit);
         }
 
-        if samples.game_state.len() > 2000 {
+        if samples.game_state.len() > 2 * hypers::MAX_TURNS_PER_GAME {
             panic!("{}", g.turn());
         }
 
@@ -252,7 +255,7 @@ fn play_game_to_end(
         let curr_state_batch = curr_state
             .view((
                 1,
-                INPUT_ENCODED_DIMS as i64,
+                hypers::INPUT_ENCODED_DIMS as i64,
                 BOARD_SIZE as i64,
                 BOARD_SIZE as i64,
             ))
@@ -301,7 +304,6 @@ fn play_game_to_end(
 }
 
 fn _train_loop(adam: &mut Optimizer, model: &mut HiveModel, frames: &MultipleGames) {
-
     let state_buffer = Tensor::stack(frames.game_state.as_slice(), 0).to(model.device);
     let mask_buffer = Tensor::stack(frames.invalid_move_mask.as_slice(), 0).to(model.device);
     let selections_buffer = Tensor::stack(frames.selected_policy.as_slice(), 0).to(model.device);
@@ -325,7 +327,7 @@ fn _train_loop(adam: &mut Optimizer, model: &mut HiveModel, frames: &MultipleGam
 
         for start in (0..frames.len()).step_by(hypers::BATCH_SIZE) {
             adam.zero_grad();
-            let upper = frames.len().min(start + BATCH_SIZE) as i64;
+            let upper = frames.len().min(start + hypers::BATCH_SIZE) as i64;
             let idxs = perms.i((start as i64)..upper);
 
             let states = state_buffer.index_select(0, &idxs);
@@ -344,14 +346,11 @@ fn _train_loop(adam: &mut Optimizer, model: &mut HiveModel, frames: &MultipleGam
             let clip_adv = ratio.clamp(1.0 - clip_ratio, 1.0 + clip_ratio) * &adv;
             let pi_loss = (ratio * adv).minimum(&clip_adv).mean(None).neg();
 
-            let approx_kl: f32 = (logp_old - logp)
-                .mean(None)
-                .abs()
-                .try_into()
-                .expect("success");
+            let approx_kl: f32 = (logp_old - logp).mean(None).try_into().expect("success");
 
             if approx_kl > hypers::CUTOFF_KL {
                 should_stop_early = true;
+                break;
             }
 
             let value_loss = (values - target_value_buffer.index_select(0, &idxs))
@@ -360,7 +359,7 @@ fn _train_loop(adam: &mut Optimizer, model: &mut HiveModel, frames: &MultipleGam
 
             total_value_loss = tch::no_grad(|| total_value_loss + &value_loss);
             total_value_count += 1;
-            let loss: Tensor = value_loss + (0.5 * pi_loss);
+            let loss: Tensor = value_loss + (hypers::PI_LOSS_RATIO * pi_loss);
 
             loss.backward();
             adam.step();

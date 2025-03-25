@@ -7,6 +7,7 @@ use tch::{kind::FLOAT_CPU, Tensor};
 
 pub mod hypers;
 pub mod frames;
+pub mod model;
 
 pub trait PieceEncodable {
     const PLANES_PER_COLOR: usize;

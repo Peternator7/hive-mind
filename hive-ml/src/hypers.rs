@@ -14,7 +14,7 @@ pub const GAMES_PER_AI_SIMULATION: usize = 100;
 
 /// The number of frames we're shooting for when generating training data in a
 /// whole batch. It isn't an exact target.
-pub const TARGET_FRAMES_PER_BATCH: usize = 28_000;
+pub const TARGET_FRAMES_PER_BATCH: usize = 32_000;
 
 /// The number of turns after which we cancel a game.
 pub const MAX_TURNS_PER_GAME: usize = 2000;

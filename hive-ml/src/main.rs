@@ -30,12 +30,14 @@ pub fn main() -> Result<(), Box<dyn Error>> {
     vs.save("models/initial.weights")?;
 
     let frames = Mutex::new(MultipleGames::default());
+    let quantiles = Tensor::from_slice(&[0.5f32, 0.8f32, 0.99f32]);
+
     for epoch in 1..100 {
         let st = Instant::now();
         let games_played = &AtomicUsize::new(0);
-        let games_finished = &AtomicUsize::new(0);
-        let games_total_length = &AtomicUsize::new(0);
         let games_stalled = &AtomicUsize::new(0);
+        let mut games_lengths: &Mutex<Vec<f32>> = &Mutex::new(Vec::new());
+        let games_finished = &AtomicUsize::new(0);
         std::thread::scope(|scope| {
             let handles = (0..hypers::PARALLEL_GAMES)
                 .map(|_| {
@@ -66,7 +68,7 @@ pub fn main() -> Result<(), Box<dyn Error>> {
                             };
 
                             games_finished.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            games_total_length.fetch_add(game.turn(), std::sync::atomic::Ordering::Relaxed);
+                            games_lengths.lock().unwrap().push(game.turn() as f32);
                             let mut frames = frames.lock().unwrap();
                             frames.ingest_game(
                                 samples,
@@ -93,17 +95,19 @@ pub fn main() -> Result<(), Box<dyn Error>> {
         })?;
 
         let mut frames = frames.lock().unwrap();
-        let total_len = games_total_length.load(std::sync::atomic::Ordering::Relaxed);
-        let finished = games_finished.load(std::sync::atomic::Ordering::Relaxed);
+        let lengths = Tensor::from_slice(games_lengths.lock().unwrap().as_slice());
+        let percentiles: Vec<f32> = lengths.quantile(&quantiles, None, false, "linear").try_into()?;
 
         println!(
-            "Total Games: {}, Finished: {}, Avg. Turns: {}, Stalled: {}, Avg  Time: {}s, Frame Count: {}",
+            "Total Games: {}, Finished: {}, Stalled: {}, Avg  Time: {}s, Frame Count: {}, P50 Turns: {}, P80 Turns: {}, P99 Turns: {}",
             games_played.load(std::sync::atomic::Ordering::Relaxed),
-            finished,
-            total_len as f32 / finished as f32,
+            games_finished.load(std::sync::atomic::Ordering::Relaxed),
             games_stalled.load(std::sync::atomic::Ordering::Relaxed),
             (Instant::now() - st).as_secs_f32(),
             frames.len(),
+            percentiles[0],
+            percentiles[1],
+            percentiles[2],
         );
 
         // Do a training loop.

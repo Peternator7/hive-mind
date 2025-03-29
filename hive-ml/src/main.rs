@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::error::Error;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Mutex;
@@ -9,11 +8,9 @@ use hive_engine::game::GameWinner;
 use hive_engine::movement::Move;
 use hive_engine::piece::{Insect, Piece};
 use hive_engine::position::Position;
-use hive_engine::BOARD_SIZE;
 use hive_engine::{game::Game, piece::Color};
 use hive_ml::encode::{
-    translate_game_to_conv_tensor, translate_game_to_seq_tensor, translate_to_valid_moves_mask,
-    PieceEncodable,
+    translate_game_to_conv_tensor, translate_to_valid_moves_mask,
 };
 use hive_ml::{
     frames::{MultipleGames, SingleGame},
@@ -31,6 +28,7 @@ pub fn main() -> Result<(), Box<dyn Error>> {
 
     let vs = nn::VarStore::new(device);
     let model = Mutex::new(HiveModel::new(&vs.root()));
+    let mut lr = hypers::LEARNING_RATE;
 
     vs.save("models/initial.weights")?;
 
@@ -123,7 +121,7 @@ pub fn main() -> Result<(), Box<dyn Error>> {
         // Create a new optimizer each epoch to avoid momentum carrying over inappropriate
         // from batch to batch.
         let mut adam = nn::Adam::default()
-            .build(&vs, hypers::LEARNING_RATE)
+            .build(&vs, lr)
             .unwrap();
         _train_loop(&mut adam, &mut *model.lock().unwrap(), &*frames);
         println!(
@@ -137,6 +135,8 @@ pub fn main() -> Result<(), Box<dyn Error>> {
         vs.save(format!("models/epoch_{0}", epoch))?;
 
         if epoch % 10 == 0 {
+            lr = lr / 2.0;
+
             println!("Test against random model...");
 
             let mut old_vs = VarStore::new(device);
@@ -275,14 +275,7 @@ fn play_game_to_end(
 
         let playing = g.to_play();
         let curr_state = translate_game_to_conv_tensor(&g, playing);
-        let curr_state_batch = curr_state
-            .view((
-                1,
-                hypers::INPUT_ENCODED_DIMS as i64,
-                BOARD_SIZE as i64,
-                BOARD_SIZE as i64,
-            ))
-            .to(device);
+        let curr_state_batch = curr_state.unsqueeze(0).to(device);
 
         let map = translate_to_valid_moves_mask(&g, &valid_moves, playing, &mut invalid_moves_mask);
         let invalid_moves_tensor = Tensor::from_slice(&invalid_moves_mask);

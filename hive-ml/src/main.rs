@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::error::Error;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Mutex;
@@ -9,16 +8,12 @@ use hive_engine::game::GameWinner;
 use hive_engine::movement::Move;
 use hive_engine::piece::{Insect, Piece};
 use hive_engine::position::Position;
-use hive_engine::BOARD_SIZE;
 use hive_engine::{game::Game, piece::Color};
-use hive_ml::encode::{
-    translate_game_to_conv_tensor, translate_game_to_seq_tensor, translate_to_valid_moves_mask,
-    PieceEncodable,
-};
+use hive_ml::encode::{self, translate_game_to_seq_tensor, translate_to_valid_moves_mask};
+use hive_ml::model2::HiveTransformerModel;
 use hive_ml::{
     frames::{MultipleGames, SingleGame},
     hypers::{self},
-    model::HiveModel,
 };
 use tch::nn::{Optimizer, OptimizerConfig, VarStore};
 use tch::{nn, IndexOp, Kind, Tensor};
@@ -30,7 +25,7 @@ pub fn main() -> Result<(), Box<dyn Error>> {
     let device = tch::Device::cuda_if_available();
 
     let vs = nn::VarStore::new(device);
-    let model = Mutex::new(HiveModel::new(&vs.root()));
+    let model = Mutex::new(HiveTransformerModel::new(&vs.root()));
 
     vs.save("models/initial.weights")?;
 
@@ -140,7 +135,7 @@ pub fn main() -> Result<(), Box<dyn Error>> {
             println!("Test against random model...");
 
             let mut old_vs = VarStore::new(device);
-            let old_model = Mutex::new(HiveModel::new(&old_vs.root()));
+            let old_model = Mutex::new(HiveTransformerModel::new(&old_vs.root()));
             old_vs.load("models/initial.weights")?;
 
             let st = Instant::now();
@@ -211,8 +206,8 @@ pub fn main() -> Result<(), Box<dyn Error>> {
 
 fn play_game_to_end(
     g: &mut Game,
-    white_model: &Mutex<HiveModel>,
-    black_model: &Mutex<HiveModel>,
+    white_model: &Mutex<HiveTransformerModel>,
+    black_model: &Mutex<HiveTransformerModel>,
     samples: &mut SingleGame,
 ) -> hive_engine::Result<Option<Color>> {
     let mut consecutive_passes = 0;
@@ -274,21 +269,15 @@ fn play_game_to_end(
         }
 
         let playing = g.to_play();
-        let curr_state = translate_game_to_conv_tensor(&g, playing);
-        let curr_state_batch = curr_state
-            .view((
-                1,
-                hypers::INPUT_ENCODED_DIMS as i64,
-                BOARD_SIZE as i64,
-                BOARD_SIZE as i64,
-            ))
-            .to(device);
+        let (curr_state, seq_length) = translate_game_to_seq_tensor(&g, playing);
+        let curr_state_batch = curr_state.unsqueeze(0);
+        let curr_state_mask = encode::length_masks().i(seq_length as i64).unsqueeze(0);
 
         let map = translate_to_valid_moves_mask(&g, &valid_moves, playing, &mut invalid_moves_mask);
         let invalid_moves_tensor = Tensor::from_slice(&invalid_moves_mask);
 
         let (value, mut policy) =
-            tch::no_grad(|| model.lock().unwrap().value_policy(&curr_state_batch));
+            tch::no_grad(|| model.lock().unwrap().value_policy(&curr_state_batch, &curr_state_mask));
 
         let _ = policy.masked_fill_(&invalid_moves_tensor.to(device), f64::NEG_INFINITY);
 
@@ -304,19 +293,23 @@ fn play_game_to_end(
         samples
             .selected_policy
             .push(sampled_action_idx.view(1i64).to(tch::Device::Cpu));
+        samples.seq_length.push(Tensor::from(seq_length as i64).view(1i64));
     }
 
     Ok(winner)
 }
 
-fn _train_loop(adam: &mut Optimizer, model: &mut HiveModel, frames: &MultipleGames) {
+fn _train_loop(adam: &mut Optimizer, model: &mut HiveTransformerModel, frames: &MultipleGames) {
+    let length_masks = encode::length_masks().to(model.device);
+
     let state_buffer = Tensor::stack(frames.game_state.as_slice(), 0).to(model.device);
     let mask_buffer = Tensor::stack(frames.invalid_move_mask.as_slice(), 0).to(model.device);
     let selections_buffer = Tensor::stack(frames.selected_policy.as_slice(), 0).to(model.device);
     let gae_buffer = Tensor::stack(frames.gae.as_slice(), 0).to(model.device);
     let target_value_buffer = Tensor::stack(frames.target_value.as_slice(), 0).to(model.device);
+    let length_mask_buffer = length_masks.index_select(0, & Tensor::stack(frames.sequence_length.as_slice(), 0).to(model.device));
 
-    let logp_old = tch::no_grad(|| model.policy(&state_buffer))
+    let logp_old = tch::no_grad(|| model.policy(&state_buffer, &length_mask_buffer))
         .masked_fill_(&mask_buffer, f64::NEG_INFINITY)
         .log_softmax(1, None)
         .gather(1, &selections_buffer, false);
@@ -337,7 +330,8 @@ fn _train_loop(adam: &mut Optimizer, model: &mut HiveModel, frames: &MultipleGam
             let idxs = perms.i((start as i64)..upper);
 
             let states = state_buffer.index_select(0, &idxs);
-            let (values, mut policies) = model.value_policy(&states);
+            let length_masks = length_mask_buffer.index_select(0, &idxs);
+            let (values, mut policies) = model.value_policy(&states, &length_masks);
 
             let adv = gae_buffer.index_select(0, &idxs);
 

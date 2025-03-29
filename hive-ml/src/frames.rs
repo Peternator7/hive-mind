@@ -5,14 +5,18 @@ use tch::Tensor;
 pub struct MultipleGames {
     pub game_state: Vec<Tensor>,
 
+    pub sequence_length: Vec<Tensor>,
+
     /// A 1x1 tensor that contains the index sampled by the policy.
     pub selected_policy: Vec<Tensor>,
 
     /// A mask that represents the actions that are invalid in the current state.
     pub invalid_move_mask: Vec<Tensor>,
+
     /// A tensor that represents the rewards we got from making this decision.
     /// Not time discounted.
     pub gae: Vec<Tensor>,
+
     pub target_value: Vec<Tensor>,
 }
 
@@ -35,6 +39,7 @@ impl MultipleGames {
             && len == self.invalid_move_mask.len()
             && len == self.gae.len()
             && len == self.target_value.len()
+            && len == self.sequence_length.len()
     }
 
     pub fn ingest_game(
@@ -98,6 +103,7 @@ impl MultipleGames {
         }
 
         self.game_state.extend(other.game_state.drain(..).skip(samples_to_skip));
+        self.sequence_length.extend(other.seq_length.drain(..).skip(samples_to_skip));
         self.selected_policy.extend(other.selected_policy.drain(..).skip(samples_to_skip));
         self.invalid_move_mask
             .extend(other.invalid_move_mask.drain(..).skip(samples_to_skip));
@@ -122,6 +128,8 @@ pub struct SingleGame {
     pub invalid_move_mask: Vec<Tensor>,
 
     pub value: Vec<Tensor>,
+
+    pub seq_length: Vec<Tensor>,
 }
 
 impl SingleGame {
@@ -131,6 +139,7 @@ impl SingleGame {
         self.selected_policy.clear();
         self.invalid_move_mask.clear();
         self.value.clear();
+        self.seq_length.clear();
     }
 
     pub fn len(&self) -> usize {
@@ -143,5 +152,6 @@ impl SingleGame {
             && len == self.selected_policy.len()
             && len == self.invalid_move_mask.len()
             && len == self.value.len()
+            && len == self.seq_length.len()
     }
 }

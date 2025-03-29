@@ -1,7 +1,7 @@
 use core::f32;
 use std::{
     collections::HashMap,
-    sync::{Mutex, OnceLock},
+    sync::{Arc, Mutex, OnceLock},
 };
 
 use hive_engine::{
@@ -19,7 +19,19 @@ pub fn length_masks() -> std::sync::MutexGuard<'static, Tensor> {
 
     LENGTH_MASKS
         .get_or_init(|| {
-            let t = Tensor::from(1.0);
+            let s: i64 = 1 + hypers::MAX_SEQ_LENGTH as i64;
+            let mut t = Tensor::zeros(&[s + 1, s, s], (tch::Kind::Bool, tch::Device::Cpu));
+            let true_t = &Tensor::from(true);
+            for i in 0..(s + 1) {
+                let i_t = Tensor::from(i);
+                for j in 0..i {
+                    let j_t = Tensor::from(j);
+                    for k in 0..i {
+                        let k_t = Tensor::from(k);
+                        let _ = t.index_put_(&[Some(&i_t), Some(&j_t), Some(&k_t)], true_t, false);
+                    }
+                }
+            }
 
             Mutex::new(t)
         })
@@ -117,9 +129,7 @@ pub fn translate_to_valid_moves_mask(
         // 22 pieces total on the board
         // 7 relative directions (6 hex directions + on top of)
 
-        22 * 7 * piece_idx
-        + 7 * adj_piece_idx
-        + relative_pos
+        22 * 7 * piece_idx + 7 * adj_piece_idx + relative_pos
     }
 
     for mv in valid_moves {
@@ -181,17 +191,24 @@ pub fn translate_pieces_to_seq_tensor(
 ) -> (Tensor, usize) {
     let mut t = Tensor::zeros(
         [
-            hypers::MAX_SEQ_LENGTH,
+            hypers::MAX_SEQ_LENGTH + 1,
             hypers::INPUT_ENCODED_DIMS as i64 + 6,
         ],
         tch::kind::FLOAT_CPU,
     );
+
+    let emb = &mut [0.0; hypers::INPUT_ENCODED_DIMS + 6];
+    // We use the 0th item in the sequence to select the output.
+    // Initialize it to some constant value so it isn't overly sensitive
+    // to any specific piece being first in the list.
+    emb.fill(1.0);
+    let _ = t.index_put_(&[Some(Tensor::from(0))], &Tensor::from_slice(emb), false);
+
     for (idx, (pos, piece, height)) in pieces.iter().enumerate() {
+        emb.fill(0.0);
         let i = piece.encode(perspective);
         let (x, y, z) = pos.to_cube_coords();
         assert!(z <= 0);
-
-        let emb = &mut [0.0; hypers::INPUT_ENCODED_DIMS + 6];
 
         emb[i] = 1.0;
         if *height > 0 {
@@ -215,13 +232,13 @@ pub fn translate_pieces_to_seq_tensor(
         emb[INPUT_ENCODED_DIMS + 5] = z_encode.1;
 
         let _ = t.index_put_(
-            &[Some(Tensor::from(idx as i64))],
+            &[Some(Tensor::from(1 + idx as i64))],
             &Tensor::from_slice(emb),
             false,
         );
     }
 
-    (t, pieces.len())
+    (t, pieces.len() + 1)
 }
 
 thread_local! {

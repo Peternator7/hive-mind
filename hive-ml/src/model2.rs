@@ -1,71 +1,61 @@
 use crate::hypers::{INPUT_ENCODED_DIMS, OUTPUT_LENGTH};
-use tch::{
-    nn,
-    Tensor,
-};
+use tch::{nn, Tensor};
 
-pub struct HiveModel {
+pub struct HiveTransformerModel {
     pub device: tch::Device,
-    shared_layers: tch::nn::Sequential,
+    t1: MultiHeadSelfAttention,
+    t2: MultiHeadSelfAttention,
+    t3: MultiHeadSelfAttention,
     policy_layer: tch::nn::Sequential,
     value_layer: tch::nn::Sequential,
 }
 
-impl HiveModel {
+impl HiveTransformerModel {
     pub fn new(p: &nn::Path) -> Self {
-        let i = INPUT_ENCODED_DIMS as i64;
-        let shared_layers = nn::seq()
-            // First two layers are 16 channel convolution
-            .add(nn::conv2d(p / "c1", i, 16, 3, Default::default()))
-            .add_fn(|xs| xs.relu())
-            .add(nn::conv2d(p / "c2", 16, 16, 3, Default::default()))
-            .add_fn(|xs| xs.relu())
-            // Max pool and then 32 channel convolutions
-            .add_fn(|xs| xs.max_pool2d_default(2))
-            .add(nn::conv2d(p / "c3", 16, 32, 3, Default::default()))
-            .add_fn(|xs| xs.relu())
-            .add(nn::conv2d(p / "c4", 32, 32, 3, Default::default()))
-            .add_fn(|xs| xs.relu())
-            // Max pool and then flatten.
-            // .add_fn(|xs| xs.max_pool2d_default(2))
-            .add_fn(|xs| xs.flat_view())
-            // .add_fn(|xs| xs.relu().flat_view())
-            .add(nn::linear(p / "l1", 3200, 256, Default::default()))
-            .add_fn(|xs| xs.relu())
-            .add(nn::linear(p / "l2", 256, 256, Default::default()))
-            .add_fn(|xs| xs.relu());
+        let i = 6 + INPUT_ENCODED_DIMS as i64;
+
+        let t1 = MultiHeadSelfAttention::new(p, i, 1024, 8);
+        let t2 = MultiHeadSelfAttention::new(p, i, 1024, 8);
+        let t3 = MultiHeadSelfAttention::new(p, i, 1024, 8);
 
         let value_layer = nn::seq()
-            .add(nn::linear(p / "c1", 256, 1, Default::default()))
+            .add(nn::linear(p / "c1", 36, 1, Default::default()))
             .add_fn(|xs| xs.sigmoid() - 0.5);
 
         let policy_layer = nn::seq().add(nn::linear(
             p / "al",
-            256,
+            36,
             OUTPUT_LENGTH as i64,
             Default::default(),
         ));
 
         Self {
-            shared_layers,
+            t1,
+            t2,
+            t3,
             policy_layer,
             value_layer,
             device: p.device(),
         }
     }
 
-    pub fn value_policy(&self, game_state: &Tensor) -> (Tensor, Tensor) {
-        let t = self.shared_layers(game_state);
+    pub fn value_policy(&self, game_state: &Tensor, seq_mask: &Tensor) -> (Tensor, Tensor) {
+        let t = self.shared_layers(game_state, seq_mask);
         (t.apply(&self.value_layer), t.apply(&self.policy_layer))
     }
 
-    pub fn policy(&self, game_state: &Tensor) -> Tensor {
-        let t = self.shared_layers(game_state);
+    pub fn policy(&self, game_state: &Tensor, seq_mask: &Tensor) -> Tensor {
+        let t = self.shared_layers(game_state, seq_mask);
         t.apply(&self.policy_layer)
     }
 
-    fn shared_layers(&self, game_state: &Tensor) -> Tensor {
-        game_state.apply(&self.shared_layers)
+    fn shared_layers(&self, game_state: &Tensor, seq_mask: &Tensor) -> Tensor {
+        let output = game_state + self.t1.forward(game_state, seq_mask);
+        let output = &output + self.t2.forward(&output, seq_mask);
+        let output = &output + self.t3.forward(&output, seq_mask);
+
+        // shape is [batch, seq, embed]
+        output.index(&[None, Some(Tensor::from(0))])
     }
 }
 

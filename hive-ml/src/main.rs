@@ -7,14 +7,18 @@ use std::time::Instant;
 use hive_engine::error::HiveError;
 use hive_engine::game::GameWinner;
 use hive_engine::movement::Move;
+use hive_engine::piece::{Insect, Piece};
+use hive_engine::position::Position;
 use hive_engine::BOARD_SIZE;
 use hive_engine::{game::Game, piece::Color};
-use hive_ml::encode::translate_game_to_seq_tensor;
+use hive_ml::encode::{
+    translate_game_to_conv_tensor, translate_game_to_seq_tensor, translate_to_valid_moves_mask,
+    PieceEncodable,
+};
 use hive_ml::{
     frames::{MultipleGames, SingleGame},
     hypers::{self},
     model::HiveModel,
-    translate_to_tensor, PieceEncodable,
 };
 use tch::nn::{Optimizer, OptimizerConfig, VarStore};
 use tch::{nn, IndexOp, Kind, Tensor};
@@ -97,7 +101,9 @@ pub fn main() -> Result<(), Box<dyn Error>> {
 
         let mut frames = frames.lock().unwrap();
         let lengths = Tensor::from_slice(games_lengths.lock().unwrap().as_slice());
-        let percentiles: Vec<f32> = lengths.quantile(&quantiles, None, false, "linear").try_into()?;
+        let percentiles: Vec<f32> = lengths
+            .quantile(&quantiles, None, false, "linear")
+            .try_into()?;
 
         println!(
             "Total Games: {}, Finished: {}, Stalled: {}, Avg  Time: {}s, Frame Count: {}, P50 Turns: {}, P80 Turns: {}, P99 Turns: {}",
@@ -213,6 +219,18 @@ fn play_game_to_end(
     let mut valid_moves = Vec::new();
     let mut invalid_moves_mask = vec![true; hypers::OUTPUT_LENGTH];
     let mut winner = None;
+
+    // Since the model plays pieces relative to other pieces, it doesn't know how to make
+    // the first move.
+    g.make_move(Move::PlacePiece {
+        piece: Piece {
+            role: Insect::Grasshopper,
+            color: Color::White,
+            id: 0,
+        },
+        position: Position(16, 16),
+    })?;
+
     loop {
         let model = if g.to_play() == Color::White {
             white_model
@@ -256,8 +274,7 @@ fn play_game_to_end(
         }
 
         let playing = g.to_play();
-        let _ = translate_game_to_seq_tensor(&g, playing);
-        let curr_state = translate_to_tensor(&g, playing);
+        let curr_state = translate_game_to_conv_tensor(&g, playing);
         let curr_state_batch = curr_state
             .view((
                 1,
@@ -267,24 +284,7 @@ fn play_game_to_end(
             ))
             .to(device);
 
-        let mut map = HashMap::new();
-
-        for mv in &valid_moves {
-            let (plane, pos) = match mv {
-                Move::MovePiece { piece, to, .. } => (piece.encode(playing), to),
-                Move::PlacePiece { piece, position } => (piece.encode(playing), position),
-                Move::Pass => unreachable!(),
-            };
-
-            let idx = plane * (BOARD_SIZE as usize * BOARD_SIZE as usize)
-                + (BOARD_SIZE as usize * pos.0 as usize)
-                + (pos.1 as usize);
-
-            // This is a valid move.
-            invalid_moves_mask[idx] = false;
-            map.entry(idx).insert_entry(mv);
-        }
-
+        let map = translate_to_valid_moves_mask(&g, &valid_moves, playing, &mut invalid_moves_mask);
         let invalid_moves_tensor = Tensor::from_slice(&invalid_moves_mask);
 
         let (value, mut policy) =
@@ -295,7 +295,7 @@ fn play_game_to_end(
         let sampled_action_idx = policy.softmax(-1, None).multinomial(1, true);
         let action_prob: i64 = i64::try_from(&sampled_action_idx).expect("cast");
         let mv = map.get(&(action_prob as usize)).expect("populated above.");
-        g.make_move(**mv)?;
+        g.make_move(*mv)?;
 
         samples.playing.push(playing);
         samples.game_state.push(curr_state);

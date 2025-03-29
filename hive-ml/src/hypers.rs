@@ -1,6 +1,5 @@
 pub const INPUT_ENCODED_DIMS: usize = 2 * 11 + (2 * 4); // 11 pieces, 4 levels of beetle stacking.
-pub const OUTPUT_LENGTH: usize =
-    11 * hive_engine::BOARD_SIZE as usize * hive_engine::BOARD_SIZE as usize;
+pub const OUTPUT_LENGTH: usize = 11 * 22 * 7;
 
 /// If the KL Loss gets high, we should stop the training
 /// batch because we might be moving outside of the proximal

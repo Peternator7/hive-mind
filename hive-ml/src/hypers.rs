@@ -39,3 +39,5 @@ pub const LEARNING_RATE: f64 = 5e-4;
 
 pub const GAMMA: f64 = 0.95;
 pub const LAMBDA: f64 = 0.75;
+
+pub const MAX_SEQ_LENGTH: i64 = 2 * 11;

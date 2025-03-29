@@ -9,6 +9,7 @@ use hive_engine::game::GameWinner;
 use hive_engine::movement::Move;
 use hive_engine::BOARD_SIZE;
 use hive_engine::{game::Game, piece::Color};
+use hive_ml::encode::translate_game_to_seq_tensor;
 use hive_ml::{
     frames::{MultipleGames, SingleGame},
     hypers::{self},
@@ -36,7 +37,7 @@ pub fn main() -> Result<(), Box<dyn Error>> {
         let st = Instant::now();
         let games_played = &AtomicUsize::new(0);
         let games_stalled = &AtomicUsize::new(0);
-        let mut games_lengths: &Mutex<Vec<f32>> = &Mutex::new(Vec::new());
+        let games_lengths: &Mutex<Vec<f32>> = &Mutex::new(Vec::new());
         let games_finished = &AtomicUsize::new(0);
         std::thread::scope(|scope| {
             let handles = (0..hypers::PARALLEL_GAMES)
@@ -255,6 +256,7 @@ fn play_game_to_end(
         }
 
         let playing = g.to_play();
+        let _ = translate_game_to_seq_tensor(&g, playing);
         let curr_state = translate_to_tensor(&g, playing);
         let curr_state_batch = curr_state
             .view((

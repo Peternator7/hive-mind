@@ -6,6 +6,7 @@ pub mod hand;
 pub mod movement;
 pub mod piece;
 pub mod position;
+pub mod utils;
 
 pub type Result<T> = std::result::Result<T, error::HiveError>;
 

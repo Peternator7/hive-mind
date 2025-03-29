@@ -1,5 +1,7 @@
 use std::fmt;
 
+use crate::error::HiveError;
+
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct Position(pub u8, pub u8);
 
@@ -80,6 +82,43 @@ impl Position {
                 return Some(Position(x - 1, y));
             }
         }
+    }
+
+    pub fn to_cube_coords(self) -> (isize, isize, isize) {
+        let Position(x, y) = self;
+
+        (x as isize, y as isize, 0 - x as isize - y as isize)
+    }
+
+    fn from_cube_coords(x: isize, y: isize, z: isize, dim: u8) -> crate::Result<Self> {
+        let dim = dim as isize;
+        let _ = z;
+        if x < 0 || x >= dim {
+            return Err(HiveError::RotationOutOfBounds);
+        }
+
+        if y < 0 || y >= dim {
+            return Err(HiveError::PositionOutOfBounds);
+        }
+
+        Ok(Self(x as u8, y as u8))
+    }
+
+    pub fn rotate_clockwise_around_center(
+        self,
+        center: Position,
+        dim: u8,
+    ) -> crate::Result<Position> {
+        let (x, y, z) = self.to_cube_coords();
+        let (c_x, c_y, c_z) = center.to_cube_coords();
+
+        // Re-center after subtracting the offset.
+        let (x, y, z) = (x - c_x, y - c_y, z - c_z);
+
+        // Rotate + add center back in.
+        let (x, y, z) = (-y + c_x, -z + c_y, -x + c_z);
+
+        Self::from_cube_coords(x, y, z, dim)
     }
 }
 

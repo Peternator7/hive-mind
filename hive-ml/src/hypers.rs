@@ -36,7 +36,7 @@ pub const BATCH_SIZE: usize = 128;
 /// value because it's typically less stable.
 pub const PI_LOSS_RATIO: f64 = 0.1;
 
-pub const LEARNING_RATE: f64 = 1e-4;
+pub const LEARNING_RATE: f64 = 1e-5;
 
 pub const GAMMA: f64 = 0.95;
 pub const LAMBDA: f64 = 0.75;

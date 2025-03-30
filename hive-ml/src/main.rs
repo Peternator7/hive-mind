@@ -271,10 +271,14 @@ fn play_game_to_end(
 
         let playing = g.to_play();
         let (curr_state, seq_length) = tch::no_grad(|| translate_game_to_seq_tensor(&g, playing));
-        
+
         let curr_state_batch = curr_state.unsqueeze(0).to(device);
-        let curr_state_mask = lengths_mask.i(seq_length as i64).unsqueeze(0).unsqueeze(0).to(device);
-        
+        let curr_state_mask = lengths_mask
+            .i(seq_length as i64)
+            .unsqueeze(0)
+            .unsqueeze(0)
+            .to(device);
+
         let map = translate_to_valid_moves_mask(&g, &valid_moves, playing, &mut invalid_moves_mask);
         let invalid_moves_tensor = Tensor::from_slice(&invalid_moves_mask);
 

@@ -1,4 +1,3 @@
-use crate::hypers::{OUTPUT_LENGTH};
 use tch::{nn, Tensor};
 
 pub struct HiveTransformerModel {
@@ -14,9 +13,9 @@ impl HiveTransformerModel {
     pub fn new(p: &nn::Path) -> Self {
         let i = crate::hypers::EMBED_DIMS as i64;
 
-        let t1 = MultiHeadSelfAttention::new(p, i, 1024, 8);
-        let t2 = MultiHeadSelfAttention::new(p, i, 1024, 8);
-        let t3 = MultiHeadSelfAttention::new(p, i, 1024, 8);
+        let t1 = MultiHeadSelfAttention::new(p, i, 256, 8);
+        let t2 = MultiHeadSelfAttention::new(p, i, 256, 8);
+        let t3 = MultiHeadSelfAttention::new(p, i, 256, 8);
 
         let value_layer = nn::seq()
             .add(nn::linear(p / "c1", i, 1, Default::default()))
@@ -25,7 +24,7 @@ impl HiveTransformerModel {
         let policy_layer = nn::seq().add(nn::linear(
             p / "al",
             i,
-            OUTPUT_LENGTH as i64,
+            crate::hypers::OUTPUT_LENGTH as i64,
             Default::default(),
         ));
 
@@ -110,6 +109,7 @@ impl MultiHeadSelfAttention {
         let value = value
             .unflatten(-1, [self.nheads, self.head_dim])
             .transpose(1, 2);
+
 
         // Step 3. Run SDPA
         // (N, nheads, L_t, E_head)

@@ -9,7 +9,11 @@ use hive_engine::movement::Move;
 use hive_engine::piece::{Insect, Piece};
 use hive_engine::position::Position;
 use hive_engine::{game::Game, piece::Color};
-use hive_ml::encode::{self, translate_game_to_seq_tensor, translate_to_valid_moves_mask};
+use hive_ml::encode::{
+    self, translate_game_to_conv_tensor, translate_game_to_seq_tensor,
+    translate_to_valid_moves_mask,
+};
+use hive_ml::model::HiveModel;
 use hive_ml::model2::HiveTransformerModel;
 use hive_ml::{
     frames::{MultipleGames, SingleGame},
@@ -24,8 +28,79 @@ use tch::{nn, IndexOp, Kind, Tensor};
 pub fn main() -> Result<(), Box<dyn Error>> {
     let device = tch::Device::cuda_if_available();
 
-    let vs = nn::VarStore::new(device);
-    let model = Mutex::new(HiveTransformerModel::new(&vs.root()));
+    let mut vs = nn::VarStore::new(device);
+    let transformer_model = Mutex::new(HiveTransformerModel::new(&vs.root()));
+    vs.load("models/epoch_69_lkg_transformer")?;
+
+    println!("Testing Conv vs Transformer...");
+
+    let mut conv_vs = VarStore::new(device);
+    let conv_model = Mutex::new(HiveModel::new(&conv_vs.root()));
+    conv_vs.load("models/epoch_69_lkg")?;
+
+    let st = Instant::now();
+    let games_played = &AtomicUsize::new(0);
+    let white_won = &AtomicUsize::new(0);
+    let black_won = &AtomicUsize::new(0);
+    let drawn = &AtomicUsize::new(0);
+
+    std::thread::scope(|scope| {
+        let handles = (0..hypers::PARALLEL_GAMES)
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut last_iter_failed = false;
+                    while last_iter_failed
+                        || games_played.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                            < hypers::GAMES_PER_AI_SIMULATION
+                    {
+                        last_iter_failed = false;
+                        let mut game = Game::new();
+                        match play_game_to_end_for_comparison(
+                            &mut game,
+                            &conv_model,
+                            &transformer_model,
+                        ) {
+                            Ok(None) => {
+                                drawn.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            Ok(Some(Color::White)) => {
+                                white_won.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            Ok(Some(Color::Black)) => {
+                                black_won.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            Err(HiveError::TurnLimitHit) => {
+                                last_iter_failed = true;
+                                continue;
+                            }
+                            Err(e) => return Err(e),
+                        }
+                    }
+
+                    Result::<_, HiveError>::Ok(())
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for handle in handles {
+            match handle.join() {
+                Ok(result) => result?,
+                Err(err) => std::panic::resume_unwind(err),
+            }
+        }
+
+        Result::<(), HiveError>::Ok(())
+    })?;
+
+    println!(
+        "Wins (conv): {}, Wins (transformer): {}, Ties: {}, Time: {}s",
+        white_won.load(std::sync::atomic::Ordering::Relaxed),
+        black_won.load(std::sync::atomic::Ordering::Relaxed),
+        drawn.load(std::sync::atomic::Ordering::Relaxed),
+        (Instant::now() - st).as_secs_f32(),
+    );
+
+    return Ok(());
 
     vs.save("models/initial.weights")?;
 
@@ -41,8 +116,8 @@ pub fn main() -> Result<(), Box<dyn Error>> {
         std::thread::scope(|scope| {
             let handles = (0..hypers::PARALLEL_GAMES)
                 .map(|_| {
-                    let white_model = &model;
-                    let black_model = &model;
+                    let white_model = &transformer_model;
+                    let black_model = &transformer_model;
                     scope.spawn(|| {
                         let samples = &mut SingleGame::default();
                         assert!(samples.validate_buffers());
@@ -120,7 +195,7 @@ pub fn main() -> Result<(), Box<dyn Error>> {
         let mut adam = nn::Adam::default()
             .build(&vs, hypers::LEARNING_RATE)
             .unwrap();
-        _train_loop(&mut adam, &mut *model.lock().unwrap(), &*frames);
+        _train_loop(&mut adam, &mut *transformer_model.lock().unwrap(), &*frames);
         println!(
             "Epoch: {}, Training Iteration Complete, Time Taken: {}s",
             epoch,
@@ -156,7 +231,12 @@ pub fn main() -> Result<(), Box<dyn Error>> {
                                 last_iter_failed = false;
                                 let mut game = Game::new();
                                 let samples = &mut Default::default();
-                                match play_game_to_end(&mut game, &model, &old_model, samples) {
+                                match play_game_to_end(
+                                    &mut game,
+                                    &transformer_model,
+                                    &old_model,
+                                    samples,
+                                ) {
                                     Ok(None) => {
                                         drawn.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                     }
@@ -202,6 +282,100 @@ pub fn main() -> Result<(), Box<dyn Error>> {
     }
 
     Ok(())
+}
+
+fn play_game_to_end_for_comparison(
+    g: &mut Game,
+    white_model: &Mutex<HiveModel>,
+    black_model: &Mutex<HiveTransformerModel>,
+) -> hive_engine::Result<Option<Color>> {
+    let mut consecutive_passes = 0;
+    let mut valid_moves = Vec::new();
+    let mut invalid_moves_mask = vec![true; hypers::OUTPUT_LENGTH];
+    let mut winner = None;
+    let lengths_mask = encode::length_masks().copy();
+
+    let device = white_model.lock().unwrap().device;
+
+    // Since the model plays pieces relative to other pieces, it doesn't know how to make
+    // the first move.
+    g.make_move(Move::PlacePiece {
+        piece: Piece {
+            role: Insect::Grasshopper,
+            color: Color::White,
+            id: 0,
+        },
+        position: Position(16, 16),
+    })?;
+
+    loop {
+        if g.turn() == hypers::MAX_TURNS_PER_GAME {
+            return Err(HiveError::TurnLimitHit);
+        }
+
+        if let Some(result) = g.is_game_is_over() {
+            if let GameWinner::Winner(color) = result {
+                winner = Some(color);
+            }
+
+            break;
+        }
+
+        valid_moves.clear();
+        invalid_moves_mask.fill(true);
+
+        g.load_all_potential_moves(&mut valid_moves)?;
+
+        if valid_moves.is_empty() {
+            g.make_move(Move::Pass)?;
+            consecutive_passes += 1;
+            if consecutive_passes >= 6 {
+                break;
+            }
+
+            continue;
+        } else {
+            consecutive_passes = 0;
+        }
+
+        let playing = g.to_play();
+        let map = translate_to_valid_moves_mask(&g, &valid_moves, playing, &mut invalid_moves_mask);
+        let invalid_moves_tensor = Tensor::from_slice(&invalid_moves_mask);
+
+        let mut policy = if playing == Color::White {
+            let curr_state = tch::no_grad(|| translate_game_to_conv_tensor(&g, playing));
+            let curr_state_batch = curr_state.unsqueeze(0).to(device);
+
+            let white_model = white_model.lock().unwrap();
+            let (_, policy) = tch::no_grad(|| white_model.value_policy(&curr_state_batch));
+
+            policy
+        } else {
+            let (curr_state, seq_length) =
+                tch::no_grad(|| translate_game_to_seq_tensor(&g, playing));
+
+            let curr_state_batch = curr_state.unsqueeze(0).to(device);
+            let curr_state_mask = lengths_mask
+                .i(seq_length as i64)
+                .unsqueeze(0)
+                .unsqueeze(0)
+                .to(device);
+
+            let black_model = black_model.lock().unwrap();
+            let (_, policy) =
+                tch::no_grad(|| black_model.value_policy(&curr_state_batch, &curr_state_mask));
+
+            policy
+        };
+
+        let _ = policy.masked_fill_(&invalid_moves_tensor.to(device), f64::NEG_INFINITY);
+        let sampled_action_idx = policy.softmax(-1, None).multinomial(1, true);
+        let action_prob: i64 = i64::try_from(&sampled_action_idx).expect("cast");
+        let mv = map.get(&(action_prob as usize)).expect("populated above.");
+        g.make_move(*mv)?;
+    }
+
+    Ok(winner)
 }
 
 fn play_game_to_end(

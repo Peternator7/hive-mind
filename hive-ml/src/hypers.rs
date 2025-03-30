@@ -11,7 +11,7 @@ pub const CUTOFF_KL: f32 = 1.5 * 0.020;
 /// Number of games to run in parallel when training/testing.
 pub const PARALLEL_GAMES: usize = 8;
 
-pub const GAMES_PER_AI_SIMULATION: usize = 100;
+pub const GAMES_PER_AI_SIMULATION: usize = 1_000;
 
 /// The number of frames we're shooting for when generating training data in a
 /// whole batch. It isn't an exact target.

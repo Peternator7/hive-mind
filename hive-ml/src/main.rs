@@ -214,6 +214,7 @@ fn play_game_to_end(
     let mut valid_moves = Vec::new();
     let mut invalid_moves_mask = vec![true; hypers::OUTPUT_LENGTH];
     let mut winner = None;
+    let lengths_mask = encode::length_masks().copy();
 
     // Since the model plays pieces relative to other pieces, it doesn't know how to make
     // the first move.
@@ -269,15 +270,20 @@ fn play_game_to_end(
         }
 
         let playing = g.to_play();
-        let (curr_state, seq_length) = translate_game_to_seq_tensor(&g, playing);
-        let curr_state_batch = curr_state.unsqueeze(0);
-        let curr_state_mask = encode::length_masks().i(seq_length as i64).unsqueeze(0);
-
+        let (curr_state, seq_length) = tch::no_grad(|| translate_game_to_seq_tensor(&g, playing));
+        
+        let curr_state_batch = curr_state.unsqueeze(0).to(device);
+        let curr_state_mask = lengths_mask.i(seq_length as i64).unsqueeze(0).unsqueeze(0).to(device);
+        
         let map = translate_to_valid_moves_mask(&g, &valid_moves, playing, &mut invalid_moves_mask);
         let invalid_moves_tensor = Tensor::from_slice(&invalid_moves_mask);
 
-        let (value, mut policy) =
-            tch::no_grad(|| model.lock().unwrap().value_policy(&curr_state_batch, &curr_state_mask));
+        let (value, mut policy) = tch::no_grad(|| {
+            model
+                .lock()
+                .unwrap()
+                .value_policy(&curr_state_batch, &curr_state_mask)
+        });
 
         let _ = policy.masked_fill_(&invalid_moves_tensor.to(device), f64::NEG_INFINITY);
 
@@ -293,21 +299,30 @@ fn play_game_to_end(
         samples
             .selected_policy
             .push(sampled_action_idx.view(1i64).to(tch::Device::Cpu));
-        samples.seq_length.push(Tensor::from(seq_length as i64).view(1i64));
+        samples
+            .seq_length
+            .push(Tensor::from(seq_length as i64).view(1i64));
     }
 
     Ok(winner)
 }
 
 fn _train_loop(adam: &mut Optimizer, model: &mut HiveTransformerModel, frames: &MultipleGames) {
-    let length_masks = encode::length_masks().to(model.device);
+    let length_masks = encode::length_masks();
 
     let state_buffer = Tensor::stack(frames.game_state.as_slice(), 0).to(model.device);
     let mask_buffer = Tensor::stack(frames.invalid_move_mask.as_slice(), 0).to(model.device);
     let selections_buffer = Tensor::stack(frames.selected_policy.as_slice(), 0).to(model.device);
     let gae_buffer = Tensor::stack(frames.gae.as_slice(), 0).to(model.device);
     let target_value_buffer = Tensor::stack(frames.target_value.as_slice(), 0).to(model.device);
-    let length_mask_buffer = length_masks.index_select(0, & Tensor::stack(frames.sequence_length.as_slice(), 0).to(model.device));
+
+    let length_mask_buffer = length_masks
+        .index_select(
+            0,
+            &Tensor::stack(frames.sequence_length.as_slice(), 0).squeeze(),
+        )
+        .unsqueeze(1)
+        .to(model.device);
 
     let logp_old = tch::no_grad(|| model.policy(&state_buffer, &length_mask_buffer))
         .masked_fill_(&mask_buffer, f64::NEG_INFINITY)

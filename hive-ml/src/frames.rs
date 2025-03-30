@@ -23,6 +23,7 @@ pub struct MultipleGames {
 impl MultipleGames {
     pub fn clear(&mut self) {
         self.game_state.clear();
+        self.sequence_length.clear();
         self.selected_policy.clear();
         self.invalid_move_mask.clear();
         self.gae.clear();

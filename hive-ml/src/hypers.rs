@@ -1,4 +1,6 @@
 pub const INPUT_ENCODED_DIMS: usize = 2 * 11 + (2 * 4); // 11 pieces, 4 levels of beetle stacking.
+pub const EMBED_DIMS: usize = 64;
+
 pub const OUTPUT_LENGTH: usize = 11 * 22 * 7;
 
 /// If the KL Loss gets high, we should stop the training
@@ -13,7 +15,7 @@ pub const GAMES_PER_AI_SIMULATION: usize = 100;
 
 /// The number of frames we're shooting for when generating training data in a
 /// whole batch. It isn't an exact target.
-pub const TARGET_FRAMES_PER_BATCH: usize = 2_000;
+pub const TARGET_FRAMES_PER_BATCH: usize = 28_000;
 
 /// The number of turns after which we cancel a game.
 pub const MAX_TURNS_PER_GAME: usize = 2000;
@@ -34,7 +36,7 @@ pub const BATCH_SIZE: usize = 128;
 /// value because it's typically less stable.
 pub const PI_LOSS_RATIO: f64 = 0.1;
 
-pub const LEARNING_RATE: f64 = 5e-4;
+pub const LEARNING_RATE: f64 = 1e-4;
 
 pub const GAMMA: f64 = 0.95;
 pub const LAMBDA: f64 = 0.75;

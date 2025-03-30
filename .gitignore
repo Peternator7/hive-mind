@@ -6,3 +6,5 @@ perf.data*
 
 *.svg
 *.txt
+
+models/

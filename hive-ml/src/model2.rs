@@ -1,4 +1,4 @@
-use crate::hypers::{INPUT_ENCODED_DIMS, OUTPUT_LENGTH};
+use crate::hypers::{OUTPUT_LENGTH};
 use tch::{nn, Tensor};
 
 pub struct HiveTransformerModel {
@@ -12,19 +12,19 @@ pub struct HiveTransformerModel {
 
 impl HiveTransformerModel {
     pub fn new(p: &nn::Path) -> Self {
-        let i = 6 + INPUT_ENCODED_DIMS as i64;
+        let i = crate::hypers::EMBED_DIMS as i64;
 
         let t1 = MultiHeadSelfAttention::new(p, i, 1024, 8);
         let t2 = MultiHeadSelfAttention::new(p, i, 1024, 8);
         let t3 = MultiHeadSelfAttention::new(p, i, 1024, 8);
 
         let value_layer = nn::seq()
-            .add(nn::linear(p / "c1", 36, 1, Default::default()))
+            .add(nn::linear(p / "c1", i, 1, Default::default()))
             .add_fn(|xs| xs.sigmoid() - 0.5);
 
         let policy_layer = nn::seq().add(nn::linear(
             p / "al",
-            36,
+            i,
             OUTPUT_LENGTH as i64,
             Default::default(),
         ));
@@ -52,7 +52,7 @@ impl HiveTransformerModel {
     fn shared_layers(&self, game_state: &Tensor, seq_mask: &Tensor) -> Tensor {
         let output = game_state + self.t1.forward(game_state, seq_mask);
         let output = &output + self.t2.forward(&output, seq_mask);
-        let output = &output + self.t3.forward(&output, seq_mask);
+        let output = self.t3.forward(&output, seq_mask);
 
         // shape is [batch, seq, embed]
         output.index(&[None, Some(Tensor::from(0))])

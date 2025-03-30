@@ -1,7 +1,7 @@
 use core::f32;
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{Mutex, OnceLock},
 };
 
 use hive_engine::{
@@ -192,17 +192,32 @@ pub fn translate_pieces_to_seq_tensor(
     let mut t = Tensor::zeros(
         [
             hypers::MAX_SEQ_LENGTH + 1,
-            hypers::INPUT_ENCODED_DIMS as i64 + 6,
+            hypers::EMBED_DIMS as i64,
         ],
         tch::kind::FLOAT_CPU,
     );
 
-    let emb = &mut [0.0; hypers::INPUT_ENCODED_DIMS + 6];
+    let emb = &mut [0.0; hypers::EMBED_DIMS];
     // We use the 0th item in the sequence to select the output.
     // Initialize it to some constant value so it isn't overly sensitive
     // to any specific piece being first in the list.
     emb.fill(1.0);
     let _ = t.index_put_(&[Some(Tensor::from(0))], &Tensor::from_slice(emb), false);
+
+    let z_encodings = Z_POSITION_ENCODINGS.get_or_init(|| {
+        let s = hive_engine::BOARD_SIZE as usize;
+        build_sin_cos_tensor(s, 3 * s, 2 * s)
+    });
+
+    let y_encodings = Y_POSITION_ENCODINGS.get_or_init(|| {
+        let s = hive_engine::BOARD_SIZE as usize;
+        build_sin_cos_tensor(s, 3 * s, s)
+    });
+
+    let x_encodings = X_POSITION_ENCODINGS.get_or_init(|| {
+        let s = hive_engine::BOARD_SIZE as usize;
+        build_sin_cos_tensor(s, 3 * s, 0)
+    });
 
     for (idx, (pos, piece, height)) in pieces.iter().enumerate() {
         emb.fill(0.0);
@@ -220,9 +235,9 @@ pub fn translate_pieces_to_seq_tensor(
             emb[idx] = 1.0;
         }
 
-        let x_encode = X_POSITION_ENCODINGS.with(|x_pos_encodings| x_pos_encodings[x as usize]);
-        let y_encode = Y_POSITION_ENCODINGS.with(|y_pos_encodings| y_pos_encodings[y as usize]);
-        let z_encode = Z_POSITION_ENCODINGS.with(|z_pos_encodings| z_pos_encodings[(-z) as usize]);
+        let x_encode = x_encodings[x as usize];
+        let y_encode = y_encodings[y as usize];
+        let z_encode = z_encodings[(-z) as usize];
 
         emb[INPUT_ENCODED_DIMS + 0] = x_encode.0;
         emb[INPUT_ENCODED_DIMS + 1] = x_encode.1;
@@ -241,26 +256,9 @@ pub fn translate_pieces_to_seq_tensor(
     (t, pieces.len() + 1)
 }
 
-thread_local! {
-    static LENGTH_MASKS: Vec<Tensor> = {
-        Vec::new()
-    };
-
-    static Z_POSITION_ENCODINGS: Vec<(f32,f32)> = {
-        let s = hive_engine::BOARD_SIZE as usize;
-        build_sin_cos_tensor(s, 3*s, 2 * s)
-    };
-
-    static Y_POSITION_ENCODINGS: Vec<(f32,f32)> = {
-        let s = hive_engine::BOARD_SIZE as usize;
-        build_sin_cos_tensor(s, 3*s, s)
-    };
-
-    static X_POSITION_ENCODINGS: Vec<(f32,f32)> = {
-        let s = hive_engine::BOARD_SIZE as usize;
-        build_sin_cos_tensor(s, 3*s, 0)
-    };
-}
+static X_POSITION_ENCODINGS: OnceLock<Vec<(f32, f32)>> = OnceLock::new();
+static Y_POSITION_ENCODINGS: OnceLock<Vec<(f32, f32)>> = OnceLock::new();
+static Z_POSITION_ENCODINGS: OnceLock<Vec<(f32, f32)>> = OnceLock::new();
 
 pub fn build_sin_cos_tensor(
     board_size: usize,

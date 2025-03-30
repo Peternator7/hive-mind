@@ -36,7 +36,7 @@ pub const PI_LOSS_RATIO: f64 = 0.1;
 
 pub const LEARNING_RATE: f64 = 1e-3;
 
-pub const GAMMA: f64 = 0.95;
+pub const GAMMA: f64 = 0.99;
 pub const LAMBDA: f64 = 0.75;
 
 pub const MAX_SEQ_LENGTH: i64 = 2 * 11;

@@ -29,6 +29,7 @@ pub fn main() -> Result<(), Box<dyn Error>> {
     let vs = nn::VarStore::new(device);
     let model = Mutex::new(HiveModel::new(&vs.root()));
     let mut lr = hypers::LEARNING_RATE;
+    let mut max_frames_per_game = hypers::MAX_FRAMES_PER_GAME;
 
     vs.save("models/initial.weights")?;
 
@@ -78,7 +79,7 @@ pub fn main() -> Result<(), Box<dyn Error>> {
                                 winner,
                                 hypers::GAMMA,
                                 hypers::LAMBDA,
-                                hypers::MAX_FRAMES_PER_GAME,
+                                max_frames_per_game,
                             );
                         }
 
@@ -104,7 +105,7 @@ pub fn main() -> Result<(), Box<dyn Error>> {
             .try_into()?;
 
         println!(
-            "Total Games: {}, Finished: {}, Stalled: {}, Avg  Time: {}s, Frame Count: {}, P50 Turns: {}, P80 Turns: {}, P99 Turns: {}",
+            "Total Games: {}, Finished: {}, Stalled: {}, Time: {}s, Frame Count: {}, P50 Turns: {}, P80 Turns: {}, P99 Turns: {}",
             games_played.load(std::sync::atomic::Ordering::Relaxed),
             games_finished.load(std::sync::atomic::Ordering::Relaxed),
             games_stalled.load(std::sync::atomic::Ordering::Relaxed),
@@ -136,6 +137,7 @@ pub fn main() -> Result<(), Box<dyn Error>> {
 
         if epoch % 10 == 0 {
             lr = lr / 2.0;
+            max_frames_per_game += 25;
 
             println!("Test against random model...");
 

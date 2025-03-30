@@ -28,11 +28,13 @@ impl HiveModel {
             .add_fn(|xs| xs.relu())
             .add(nn::conv2d(p / "c4", 32, 32, 3, Default::default()))
             .add_fn(|xs| xs.relu())
+            .add(nn::conv2d(p / "c5", 32, 32, 3, Default::default()))
+            .add_fn(|xs| xs.relu())
             // Max pool and then flatten.
             // .add_fn(|xs| xs.max_pool2d_default(2))
             .add_fn(|xs| xs.flat_view())
             // .add_fn(|xs| xs.relu().flat_view())
-            .add(nn::linear(p / "l1", 3200, 256, Default::default()))
+            .add(nn::linear(p / "l1", 800, 256, Default::default()))
             .add_fn(|xs| xs.relu())
             .add(nn::linear(p / "l2", 256, 256, Default::default()))
             .add_fn(|xs| xs.relu());

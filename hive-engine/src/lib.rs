@@ -10,4 +10,4 @@ pub mod utils;
 
 pub type Result<T> = std::result::Result<T, error::HiveError>;
 
-pub const BOARD_SIZE: u8 = 32;
+pub const BOARD_SIZE: u8 = 26;

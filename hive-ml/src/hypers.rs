@@ -22,7 +22,7 @@ pub const MAX_TURNS_PER_GAME: usize = 2000;
 /// frames under the assumption that frames towards the end of the game
 /// are more likely to have affected the outcome than beginning frames.
 /// This also prevents us from learning too much about any one trajectory.
-pub const MAX_FRAMES_PER_GAME: usize = 100;
+pub const MAX_FRAMES_PER_GAME: usize = 150;
 
 /// Max number of iters we'll do on a single batch of data.
 pub const TRAIN_ITERS_PER_BATCH: usize = 50;
@@ -34,9 +34,10 @@ pub const BATCH_SIZE: usize = 128;
 /// value because it's typically less stable.
 pub const PI_LOSS_RATIO: f64 = 0.1;
 
-pub const LEARNING_RATE: f64 = 1e-3;
+pub const INITIAL_LEARNING_RATE: f64 = 1e-3;
+pub const MIN_LEARNING_RATE: f64 = 1e-5;
 
-pub const GAMMA: f64 = 0.99;
+pub const GAMMA: f64 = 0.966;
 pub const LAMBDA: f64 = 0.75;
 
 pub const MAX_SEQ_LENGTH: i64 = 2 * 11;

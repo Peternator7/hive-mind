@@ -28,15 +28,17 @@ pub fn main() -> Result<(), Box<dyn Error>> {
 
     let vs = nn::VarStore::new(device);
     let model = Mutex::new(HiveModel::new(&vs.root()));
-    let mut lr = hypers::LEARNING_RATE;
+    let mut lr = hypers::INITIAL_LEARNING_RATE;
+    let mut consecutive_epochs_with_less_than_05_training_steps = 0;
+    let mut consecutive_epochs_with_more_than_20_training_steps = 0;
     let mut max_frames_per_game = hypers::MAX_FRAMES_PER_GAME;
 
-    vs.save("models/initial.weights")?;
+    vs.save("models/epoch_0")?;
 
     let frames = Mutex::new(MultipleGames::default());
     let quantiles = Tensor::from_slice(&[0.5f32, 0.8f32, 0.99f32]);
 
-    for epoch in 1..100 {
+    for epoch in 1..251 {
         let st = Instant::now();
         let games_played = &AtomicUsize::new(0);
         let games_stalled = &AtomicUsize::new(0);
@@ -105,7 +107,8 @@ pub fn main() -> Result<(), Box<dyn Error>> {
             .try_into()?;
 
         println!(
-            "Total Games: {}, Finished: {}, Stalled: {}, Time: {}s, Frame Count: {}, P50 Turns: {}, P80 Turns: {}, P99 Turns: {}",
+            "Epoch: {}, Total Games: {}, Finished: {}, Stalled: {}, Time: {}s, Frame Count: {}, P50 Turns: {}, P80 Turns: {}, P99 Turns: {}",
+            epoch,
             games_played.load(std::sync::atomic::Ordering::Relaxed),
             games_finished.load(std::sync::atomic::Ordering::Relaxed),
             games_stalled.load(std::sync::atomic::Ordering::Relaxed),
@@ -124,7 +127,33 @@ pub fn main() -> Result<(), Box<dyn Error>> {
         let mut adam = nn::Adam::default()
             .build(&vs, lr)
             .unwrap();
-        _train_loop(&mut adam, &mut *model.lock().unwrap(), &*frames);
+
+
+        let train_steps = _train_loop(&mut adam, &mut *model.lock().unwrap(), &*frames);
+
+        if train_steps < 5 {
+            consecutive_epochs_with_less_than_05_training_steps += 1;
+            consecutive_epochs_with_more_than_20_training_steps = 0;
+        } else if train_steps > 20 {
+            consecutive_epochs_with_less_than_05_training_steps = 0;
+            consecutive_epochs_with_more_than_20_training_steps += 1;
+        } else {
+            consecutive_epochs_with_less_than_05_training_steps = 0;
+            consecutive_epochs_with_more_than_20_training_steps = 0;
+        }
+
+        if consecutive_epochs_with_less_than_05_training_steps > 3 {
+            consecutive_epochs_with_less_than_05_training_steps = 0;
+            let old_lr = lr;
+            lr = hypers::MIN_LEARNING_RATE.max(lr * 0.667);
+            println!("Decreased Learning Rate, Old: {}, New: {}", old_lr, lr);
+        } else if consecutive_epochs_with_more_than_20_training_steps > 3 {
+            consecutive_epochs_with_more_than_20_training_steps = 0;
+            let old_lr = lr;
+            lr = hypers::INITIAL_LEARNING_RATE.min(lr * 1.25);
+            println!("Increased Learning Rate, Old: {}, New: {}", old_lr, lr);
+        }
+
         println!(
             "Epoch: {}, Training Iteration Complete, Time Taken: {}s",
             epoch,
@@ -136,14 +165,15 @@ pub fn main() -> Result<(), Box<dyn Error>> {
         vs.save(format!("models/epoch_{0}", epoch))?;
 
         if epoch % 10 == 0 {
-            lr = lr / 2.0;
-            max_frames_per_game += 25;
-
-            println!("Test against random model...");
-
             let mut old_vs = VarStore::new(device);
             let old_model = Mutex::new(HiveModel::new(&old_vs.root()));
-            old_vs.load("models/initial.weights")?;
+            if epoch >= 20 {
+                println!("Testing against model 20 epochs ago...");
+                old_vs.load(format!("models/epoch_{}", epoch - 20))?;
+            } else {
+                println!("Testing against initial model...");
+                old_vs.load("models/epoch_0")?;
+            }
 
             let st = Instant::now();
             let games_played = &AtomicUsize::new(0);
@@ -304,7 +334,7 @@ fn play_game_to_end(
     Ok(winner)
 }
 
-fn _train_loop(adam: &mut Optimizer, model: &mut HiveModel, frames: &MultipleGames) {
+fn _train_loop(adam: &mut Optimizer, model: &mut HiveModel, frames: &MultipleGames) -> usize {
     let state_buffer = Tensor::stack(frames.game_state.as_slice(), 0).to(model.device);
     let mask_buffer = Tensor::stack(frames.invalid_move_mask.as_slice(), 0).to(model.device);
     let selections_buffer = Tensor::stack(frames.selected_policy.as_slice(), 0).to(model.device);
@@ -374,4 +404,6 @@ fn _train_loop(adam: &mut Optimizer, model: &mut HiveModel, frames: &MultipleGam
 
     (total_value_loss / total_value_count).print();
     adam.zero_grad();
+
+    batch_count as usize
 }

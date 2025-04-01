@@ -18,37 +18,41 @@ impl HiveModel {
         let i = INPUT_ENCODED_DIMS as i64;
         let shared_layers = nn::seq()
             // First two layers are 16 channel convolution
-            .add(nn::conv2d(p / "c1", i, 16, 3, Default::default()))
+            .add(nn::conv2d(p / "c0", i, 12, 1, Default::default()))
+            .add(nn::conv2d(p / "c1", 12, 32, 3, Default::default()))
             .add_fn(|xs| xs.relu())
-            .add(nn::conv2d(p / "c2", 16, 16, 3, Default::default()))
+            .add(nn::conv2d(p / "c2", 32, 32, 3, Default::default()))
             .add_fn(|xs| xs.relu())
             // Max pool and then 32 channel convolutions
             .add_fn(|xs| xs.max_pool2d_default(2))
-            .add(nn::conv2d(p / "c3", 16, 32, 3, Default::default()))
+            .add(nn::conv2d(p / "c3", 32, 64, 3, Default::default()))
             .add_fn(|xs| xs.relu())
-            .add(nn::conv2d(p / "c4", 32, 32, 3, Default::default()))
-            .add_fn(|xs| xs.relu())
-            .add(nn::conv2d(p / "c5", 32, 32, 3, Default::default()))
+            .add(nn::conv2d(p / "c4", 64, 64, 3, Default::default()))
             .add_fn(|xs| xs.relu())
             // Max pool and then flatten.
             // .add_fn(|xs| xs.max_pool2d_default(2))
             .add_fn(|xs| xs.flat_view())
             // .add_fn(|xs| xs.relu().flat_view())
-            .add(nn::linear(p / "l1", 800, 256, Default::default()))
+            .add(nn::linear(p / "l1", 3136, 512, Default::default()))
             .add_fn(|xs| xs.relu())
-            .add(nn::linear(p / "l2", 256, 256, Default::default()))
+            .add(nn::linear(p / "l2", 512, 256, Default::default()))
             .add_fn(|xs| xs.relu());
 
         let value_layer = nn::seq()
-            .add(nn::linear(p / "c1", 256, 1, Default::default()))
+            .add(nn::linear(p / "c1", 256, 256, Default::default()))
+            .add_fn(|xs| xs.relu())
+            .add(nn::linear(p / "c2", 256, 1, Default::default()))
             .add_fn(|xs| xs.sigmoid() - 0.5);
 
-        let policy_layer = nn::seq().add(nn::linear(
-            p / "al",
-            256,
-            OUTPUT_LENGTH as i64,
-            Default::default(),
-        ));
+        let policy_layer = nn::seq()
+            .add(nn::linear(p / "a1", 256, 256, Default::default()))
+            .add_fn(|xs| xs.relu())
+            .add(nn::linear(
+                p / "a2",
+                256,
+                OUTPUT_LENGTH as i64,
+                Default::default(),
+            ));
 
         Self {
             shared_layers,

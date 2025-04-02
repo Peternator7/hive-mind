@@ -1,5 +1,5 @@
 use std::error::Error;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::Instant;
 
@@ -9,7 +9,12 @@ use hive_engine::movement::Move;
 use hive_engine::piece::{Insect, Piece};
 use hive_engine::position::Position;
 use hive_engine::{game::Game, piece::Color};
-use hive_ml::encode::{self, translate_game_to_seq_tensor, translate_to_valid_moves_mask};
+use hive_ml::encode::{
+    self, translate_game_to_conv_tensor, translate_game_to_seq_tensor,
+    translate_to_valid_moves_mask,
+};
+use hive_ml::hypers::SWITCHOVER_EPOCH;
+use hive_ml::model::HiveModel;
 use hive_ml::model2::HiveTransformerModel;
 use hive_ml::{
     frames::{MultipleGames, SingleGame},
@@ -24,10 +29,14 @@ use tch::{nn, IndexOp, Kind, Tensor};
 pub fn main() -> Result<(), Box<dyn Error>> {
     let device = tch::Device::cuda_if_available();
 
-    let vs = nn::VarStore::new(device);
-    let model = Mutex::new(HiveTransformerModel::new(&vs.root()));
+    let cnn_vs = nn::VarStore::new(device);
+    let cnn_model = Mutex::new(HiveModel::new(&cnn_vs.root()));
 
-    vs.save("models/initial.weights")?;
+    let transformer_vs = nn::VarStore::new(device);
+    let transformer_model = Mutex::new(HiveTransformerModel::new(&transformer_vs.root()));
+
+    transformer_vs.save("models/epoch_0_transformer")?;
+    cnn_vs.save("models/epoch_0")?;
 
     let frames = Mutex::new(MultipleGames::default());
     let quantiles = Tensor::from_slice(&[0.5f32, 0.8f32, 0.99f32]);
@@ -38,11 +47,16 @@ pub fn main() -> Result<(), Box<dyn Error>> {
         let games_stalled = &AtomicUsize::new(0);
         let games_lengths: &Mutex<Vec<f32>> = &Mutex::new(Vec::new());
         let games_finished = &AtomicUsize::new(0);
+
+        let model_to_use_for_decision_making = if epoch <= SWITCHOVER_EPOCH {
+            Agent::Cnn(&cnn_model)
+        } else {
+            Agent::Transformer(&transformer_model)
+        };
+
         std::thread::scope(|scope| {
             let handles = (0..hypers::PARALLEL_GAMES)
                 .map(|_| {
-                    let white_model = &model;
-                    let black_model = &model;
                     scope.spawn(|| {
                         let samples = &mut SingleGame::default();
                         assert!(samples.validate_buffers());
@@ -53,8 +67,9 @@ pub fn main() -> Result<(), Box<dyn Error>> {
 
                             let winner = match play_game_to_end(
                                 &mut game,
-                                white_model,
-                                black_model,
+                                device,
+                                &model_to_use_for_decision_making,
+                                &model_to_use_for_decision_making,
                                 samples,
                             ) {
                                 Ok(winner) => winner,
@@ -118,9 +133,22 @@ pub fn main() -> Result<(), Box<dyn Error>> {
         // Create a new optimizer each epoch to avoid momentum carrying over inappropriate
         // from batch to batch.
         let mut adam = nn::Adam::default()
-            .build(&vs, hypers::LEARNING_RATE)
+            .build(&transformer_vs, hypers::LEARNING_RATE)
             .unwrap();
-        _train_loop(&mut adam, &mut *model.lock().unwrap(), &*frames);
+
+        let mut adam_cnn = nn::Adam::default()
+            .build(&cnn_vs, hypers::LEARNING_RATE)
+            .unwrap();
+
+        _train_loop(
+            &mut adam,
+            &mut *transformer_model.lock().unwrap(),
+            &mut adam_cnn,
+            &mut *cnn_model.lock().unwrap(),
+            epoch <= hypers::SWITCHOVER_EPOCH,
+            &*frames,
+        );
+
         println!(
             "Epoch: {}, Training Iteration Complete, Time Taken: {}s",
             epoch,
@@ -129,14 +157,15 @@ pub fn main() -> Result<(), Box<dyn Error>> {
 
         frames.clear();
 
-        vs.save(format!("models/epoch_{0}", epoch))?;
+        transformer_vs.save(format!("models/epoch_{0}_transformer", epoch))?;
+        cnn_vs.save(format!("models/epoch_{0}", epoch))?;
 
         if epoch % 10 == 0 {
             println!("Test against random model...");
 
             let mut old_vs = VarStore::new(device);
-            let old_model = Mutex::new(HiveTransformerModel::new(&old_vs.root()));
-            old_vs.load("models/initial.weights")?;
+            let old_model = Mutex::new(HiveModel::new(&old_vs.root()));
+            old_vs.load("models/epoch_0")?;
 
             let st = Instant::now();
             let games_played = &AtomicUsize::new(0);
@@ -156,7 +185,13 @@ pub fn main() -> Result<(), Box<dyn Error>> {
                                 last_iter_failed = false;
                                 let mut game = Game::new();
                                 let samples = &mut Default::default();
-                                match play_game_to_end(&mut game, &model, &old_model, samples) {
+                                match play_game_to_end(
+                                    &mut game,
+                                    device,
+                                    &Agent::Transformer(&transformer_model),
+                                    &Agent::Cnn(&old_model),
+                                    samples,
+                                ) {
                                     Ok(None) => {
                                         drawn.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                     }
@@ -204,10 +239,25 @@ pub fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+pub enum Agent<'a> {
+    Transformer(&'a Mutex<HiveTransformerModel>),
+    Cnn(&'a Mutex<HiveModel>),
+}
+
+impl Agent<'_> {
+    pub fn model_type(&self) -> &str {
+        match self {
+            Agent::Transformer(..) => "transformer",
+            Agent::Cnn(..) => "cnn",
+        }
+    }
+}
+
 fn play_game_to_end(
     g: &mut Game,
-    white_model: &Mutex<HiveTransformerModel>,
-    black_model: &Mutex<HiveTransformerModel>,
+    device: tch::Device,
+    white_model: &Agent,
+    black_model: &Agent,
     samples: &mut SingleGame,
 ) -> hive_engine::Result<Option<Color>> {
     let mut consecutive_passes = 0;
@@ -238,11 +288,9 @@ fn play_game_to_end(
             return Err(HiveError::TurnLimitHit);
         }
 
-        if samples.game_state.len() > 2 * hypers::MAX_TURNS_PER_GAME {
+        if samples.pieces.len() > 2 * hypers::MAX_TURNS_PER_GAME {
             panic!("{}", g.turn());
         }
-
-        let device = model.lock().unwrap().device;
 
         if let Some(result) = g.is_game_is_over() {
             if let GameWinner::Winner(color) = result {
@@ -270,9 +318,14 @@ fn play_game_to_end(
         }
 
         let playing = g.to_play();
-        let (curr_state, seq_length) = tch::no_grad(|| translate_game_to_seq_tensor(&g, playing));
+        let (pieces, locations, seq_length) =
+            tch::no_grad(|| translate_game_to_seq_tensor(&g, playing));
 
-        let curr_state_batch = curr_state.unsqueeze(0).to(device);
+        let game_state = tch::no_grad(|| translate_game_to_conv_tensor(&g, playing));
+        let game_state_batch = game_state.unsqueeze(0).to(device);
+
+        let pieces_batch = pieces.unsqueeze(0).to(device);
+        let location_batch = locations.unsqueeze(0).to(device);
         let curr_state_mask = lengths_mask
             .i(seq_length as i64)
             .unsqueeze(0)
@@ -282,11 +335,13 @@ fn play_game_to_end(
         let map = translate_to_valid_moves_mask(&g, &valid_moves, playing, &mut invalid_moves_mask);
         let invalid_moves_tensor = Tensor::from_slice(&invalid_moves_mask);
 
-        let (value, mut policy) = tch::no_grad(|| {
-            model
-                .lock()
-                .unwrap()
-                .value_policy(&curr_state_batch, &curr_state_mask)
+        let (value, mut policy) = tch::no_grad(|| match model {
+            Agent::Transformer(mutex) => mutex.lock().unwrap().value_policy(
+                &pieces_batch,
+                &location_batch,
+                Some(&curr_state_mask),
+            ),
+            Agent::Cnn(mutex) => mutex.lock().unwrap().value_policy(&game_state_batch),
         });
 
         let _ = policy.masked_fill_(&invalid_moves_tensor.to(device), f64::NEG_INFINITY);
@@ -297,7 +352,9 @@ fn play_game_to_end(
         g.make_move(*mv)?;
 
         samples.playing.push(playing);
-        samples.game_state.push(curr_state);
+        samples.game_state.push(game_state);
+        samples.locations.push(locations);
+        samples.pieces.push(pieces);
         samples.invalid_move_mask.push(invalid_moves_tensor);
         samples.value.push(value.view(1i64).to(tch::Device::Cpu));
         samples
@@ -311,15 +368,24 @@ fn play_game_to_end(
     Ok(winner)
 }
 
-fn _train_loop(adam: &mut Optimizer, model: &mut HiveTransformerModel, frames: &MultipleGames) {
+fn _train_loop(
+    adam: &mut Optimizer,
+    model: &mut HiveTransformerModel,
+    adam_cnn: &mut Optimizer,
+    cnn: &mut HiveModel,
+    cnn_is_baseline: bool,
+    frames: &MultipleGames,
+) {
     let length_masks = encode::length_masks();
 
     let state_buffer = Tensor::stack(frames.game_state.as_slice(), 0).to(model.device);
+    let pieces_buffer = Tensor::stack(frames.pieces.as_slice(), 0).to(model.device);
     let mask_buffer = Tensor::stack(frames.invalid_move_mask.as_slice(), 0).to(model.device);
     let selections_buffer = Tensor::stack(frames.selected_policy.as_slice(), 0).to(model.device);
     let gae_buffer = Tensor::stack(frames.gae.as_slice(), 0).to(model.device);
     let target_value_buffer = Tensor::stack(frames.target_value.as_slice(), 0).to(model.device);
 
+    let location_buffer = Tensor::stack(frames.locations.as_slice(), 0).to(model.device);
     let length_mask_buffer = length_masks
         .index_select(
             0,
@@ -328,16 +394,51 @@ fn _train_loop(adam: &mut Optimizer, model: &mut HiveTransformerModel, frames: &
         .unsqueeze(1)
         .to(model.device);
 
-    let logp_old = tch::no_grad(|| model.policy(&state_buffer, &length_mask_buffer))
-        .masked_fill_(&mask_buffer, f64::NEG_INFINITY)
-        .log_softmax(1, None)
-        .gather(1, &selections_buffer, false);
+    // let logp_old =
+    //     tch::no_grad(|| model.policy(&pieces_buffer, &location_buffer, Some(&length_mask_buffer)))
+    //         .masked_fill_(&mask_buffer, f64::NEG_INFINITY)
+    //         .log_softmax(1, None)
+    //         .gather(1, &selections_buffer, false);
 
+    let old_cnn_output =
+        tch::no_grad(|| cnn.policy(&state_buffer)).masked_fill_(&mask_buffer, f64::NEG_INFINITY);
+
+    let logp_old_cnn = old_cnn_output.log_softmax(1, None);
+    //.gather(1, &selections_buffer, false);
+
+    let old_transformer_output =
+        tch::no_grad(|| model.policy(&pieces_buffer, &location_buffer, Some(&length_mask_buffer)))
+            .masked_fill_(&mask_buffer, f64::NEG_INFINITY);
+
+    let logp_old_transformer = old_transformer_output.log_softmax(1, None);
+
+    let softmax_old_transformer = old_transformer_output.softmax(1, None) + 0.000001;
+    let softmax_old_cnn = old_cnn_output.softmax(1, None) + 0.000001;
+    let cnn_vs_transformer_policy =
+        softmax_old_transformer
+            .log()
+            .kl_div(&softmax_old_cnn, tch::Reduction::Sum, false);
+    //     logp_old_transformer.kl_div(&logp_old_cnn, tch::Reduction::Sum, true);
+
+    println!(
+        "KL Divergence Between Transformer Policy and CNN: {}",
+        cnn_vs_transformer_policy / softmax_old_transformer.size()[0]
+    );
+
+    let logp_old = if cnn_is_baseline {
+        logp_old_cnn
+    } else {
+        logp_old_transformer
+    };
+    let logp_old = logp_old.gather(1, &selections_buffer, false);
     let clip_ratio = 0.1f64;
 
     let mut batch_count = 0;
-    let mut total_value_loss = Tensor::zeros(1, (Kind::Float, model.device));
+    let mut total_value_loss_transformer = Tensor::zeros(1, (Kind::Float, model.device));
+    let mut total_value_loss_cnn = Tensor::zeros(1, (Kind::Float, model.device));
     let mut total_value_count = 0;
+
+    model.train_mode.store(true, Ordering::Relaxed);
     for _ in 0..hypers::TRAIN_ITERS_PER_BATCH {
         batch_count += 1;
         let perms = Tensor::randperm(frames.len() as i64, (Kind::Int64, model.device));
@@ -345,43 +446,105 @@ fn _train_loop(adam: &mut Optimizer, model: &mut HiveTransformerModel, frames: &
 
         for start in (0..frames.len()).step_by(hypers::BATCH_SIZE) {
             adam.zero_grad();
+            adam_cnn.zero_grad();
+
             let upper = frames.len().min(start + hypers::BATCH_SIZE) as i64;
             let idxs = perms.i((start as i64)..upper);
 
-            let states = state_buffer.index_select(0, &idxs);
+            let pieces = pieces_buffer.index_select(0, &idxs);
+            let locations = location_buffer.index_select(0, &idxs);
             let length_masks = length_mask_buffer.index_select(0, &idxs);
-            let (values, mut policies) = model.value_policy(&states, &length_masks);
-
             let adv = gae_buffer.index_select(0, &idxs);
+            let logp_old = logp_old.index_select(0, &idxs);
 
-            let logp = policies
+            // Compute the transformer loss
+            let (values, mut policies) =
+                model.value_policy(&pieces, &locations, Some(&length_masks));
+
+            if true {
+                let logp = policies
+                    .masked_fill_(&mask_buffer.index_select(0, &idxs), f64::NEG_INFINITY)
+                    .log_softmax(1, None)
+                    .gather(1, &selections_buffer.index_select(0, &idxs), false);
+
+                let ratio = (&logp - &logp_old).exp_();
+                let clip_adv = ratio.clamp(1.0 - clip_ratio, 1.0 + clip_ratio) * &adv;
+                let pi_loss = (ratio * &adv).minimum(&clip_adv).mean(None).neg();
+
+                let approx_kl: f32 = (&logp_old - logp).mean(None).try_into().expect("success");
+
+                if !cnn_is_baseline {
+                    if approx_kl > hypers::CUTOFF_KL {
+                        should_stop_early = true;
+                        break;
+                    }
+                }
+
+                let value_loss = (values - target_value_buffer.index_select(0, &idxs))
+                    .square()
+                    .mean(None);
+
+                total_value_loss_transformer =
+                    tch::no_grad(|| total_value_loss_transformer + &value_loss);
+                total_value_count += 1;
+                let loss: Tensor = value_loss + (hypers::PI_LOSS_RATIO * pi_loss);
+
+                loss.backward();
+                adam.step();
+            } else {
+                let policy_softmax = policies.softmax(1, None) + 0.000001;
+                let policy_targets = softmax_old_cnn.index_select(0, &idxs);
+                let pi_loss =
+                    policy_softmax
+                        .log()
+                        .kl_div(&policy_targets, tch::Reduction::Sum, false)
+                        / hypers::BATCH_SIZE as f64;
+
+                let value_loss = (values - target_value_buffer.index_select(0, &idxs))
+                    .square()
+                    .mean(None);
+
+                total_value_loss_transformer =
+                    tch::no_grad(|| total_value_loss_transformer + &value_loss);
+                total_value_count += 1;
+                let loss = value_loss + pi_loss;
+
+                loss.backward();
+                adam.step();
+            }
+
+            // Compute the cnn loss
+            let states = state_buffer.index_select(0, &idxs);
+            let (cnn_values, mut cnn_policies) = cnn.value_policy(&states);
+
+            let logp = cnn_policies
                 .masked_fill_(&mask_buffer.index_select(0, &idxs), f64::NEG_INFINITY)
                 .log_softmax(1, None)
                 .gather(1, &selections_buffer.index_select(0, &idxs), false);
 
-            let logp_old = logp_old.index_select(0, &idxs);
-
             let ratio = (&logp - &logp_old).exp_();
             let clip_adv = ratio.clamp(1.0 - clip_ratio, 1.0 + clip_ratio) * &adv;
-            let pi_loss = (ratio * adv).minimum(&clip_adv).mean(None).neg();
+            let pi_loss_cnn = (ratio * adv).minimum(&clip_adv).mean(None).neg();
 
-            let approx_kl: f32 = (logp_old - logp).mean(None).try_into().expect("success");
+            if cnn_is_baseline {
+                let approx_kl: f32 = (logp_old - logp).mean(None).try_into().expect("success");
 
-            if approx_kl > hypers::CUTOFF_KL {
-                should_stop_early = true;
-                break;
+                if approx_kl > hypers::CUTOFF_KL {
+                    should_stop_early = true;
+                    break;
+                }
             }
 
-            let value_loss = (values - target_value_buffer.index_select(0, &idxs))
+            let value_loss = (cnn_values - target_value_buffer.index_select(0, &idxs))
                 .square()
                 .mean(None);
 
-            total_value_loss = tch::no_grad(|| total_value_loss + &value_loss);
+            total_value_loss_cnn = tch::no_grad(|| total_value_loss_cnn + &value_loss);
             total_value_count += 1;
-            let loss: Tensor = value_loss + (hypers::PI_LOSS_RATIO * pi_loss);
+            let cnn_loss: Tensor = value_loss + (hypers::PI_LOSS_RATIO * pi_loss_cnn);
 
-            loss.backward();
-            adam.step();
+            cnn_loss.backward();
+            adam_cnn.step();
         }
 
         if should_stop_early {
@@ -390,6 +553,9 @@ fn _train_loop(adam: &mut Optimizer, model: &mut HiveTransformerModel, frames: &
         }
     }
 
-    (total_value_loss / total_value_count).print();
+    model.train_mode.store(false, Ordering::Relaxed);
+    (total_value_loss_cnn / total_value_count).print();
+    (total_value_loss_transformer / total_value_count).print();
     adam.zero_grad();
+    adam_cnn.zero_grad();
 }

@@ -5,6 +5,10 @@ use tch::Tensor;
 pub struct MultipleGames {
     pub game_state: Vec<Tensor>,
 
+    pub pieces: Vec<Tensor>,
+
+    pub locations: Vec<Tensor>,
+
     pub sequence_length: Vec<Tensor>,
 
     /// A 1x1 tensor that contains the index sampled by the policy.
@@ -23,6 +27,8 @@ pub struct MultipleGames {
 impl MultipleGames {
     pub fn clear(&mut self) {
         self.game_state.clear();
+        self.pieces.clear();
+        self.locations.clear();
         self.sequence_length.clear();
         self.selected_policy.clear();
         self.invalid_move_mask.clear();
@@ -31,12 +37,14 @@ impl MultipleGames {
     }
 
     pub fn len(&self) -> usize {
-        self.game_state.len()
+        self.pieces.len()
     }
 
     pub fn validate_buffers(&self) -> bool {
-        let len = self.game_state.len();
+        let len = self.pieces.len();
         len == self.selected_policy.len()
+            && len == self.game_state.len()
+            && len == self.locations.len()
             && len == self.invalid_move_mask.len()
             && len == self.gae.len()
             && len == self.target_value.len()
@@ -103,13 +111,22 @@ impl MultipleGames {
             samples_to_skip = value.len() - max_frames_per_game;
         }
 
-        self.game_state.extend(other.game_state.drain(..).skip(samples_to_skip));
-        self.sequence_length.extend(other.seq_length.drain(..).skip(samples_to_skip));
-        self.selected_policy.extend(other.selected_policy.drain(..).skip(samples_to_skip));
+        self.game_state
+            .extend(other.game_state.drain(..).skip(samples_to_skip));
+        self.pieces
+            .extend(other.pieces.drain(..).skip(samples_to_skip));
+        self.locations
+            .extend(other.locations.drain(..).skip(samples_to_skip));
+        self.sequence_length
+            .extend(other.seq_length.drain(..).skip(samples_to_skip));
+        self.selected_policy
+            .extend(other.selected_policy.drain(..).skip(samples_to_skip));
         self.invalid_move_mask
             .extend(other.invalid_move_mask.drain(..).skip(samples_to_skip));
-        self.target_value.extend(value.into_iter().skip(samples_to_skip));
-        self.gae.extend(gae_values.into_iter().skip(samples_to_skip));
+        self.target_value
+            .extend(value.into_iter().skip(samples_to_skip));
+        self.gae
+            .extend(gae_values.into_iter().skip(samples_to_skip));
 
         other.playing.clear();
 
@@ -120,7 +137,12 @@ impl MultipleGames {
 #[derive(Debug, Default)]
 pub struct SingleGame {
     pub playing: Vec<Color>,
+
     pub game_state: Vec<Tensor>,
+
+    pub pieces: Vec<Tensor>,
+
+    pub locations: Vec<Tensor>,
 
     /// A 1x1 tensor that contains the index sampled by the policy.
     pub selected_policy: Vec<Tensor>,
@@ -135,8 +157,10 @@ pub struct SingleGame {
 
 impl SingleGame {
     pub fn clear(&mut self) {
-        self.playing.clear();
         self.game_state.clear();
+        self.playing.clear();
+        self.pieces.clear();
+        self.locations.clear();
         self.selected_policy.clear();
         self.invalid_move_mask.clear();
         self.value.clear();
@@ -149,7 +173,9 @@ impl SingleGame {
 
     pub fn validate_buffers(&self) -> bool {
         let len = self.playing.len();
-        len == self.game_state.len()
+        len == self.pieces.len()
+            && len == self.game_state.len()
+            && len == self.locations.len()
             && len == self.selected_policy.len()
             && len == self.invalid_move_mask.len()
             && len == self.value.len()

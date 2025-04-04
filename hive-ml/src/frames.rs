@@ -92,17 +92,25 @@ impl MultipleGames {
             }
         }
 
+        // if winner == Some(Color::White) {
+        //     max_frames_per_game /= 2;
+        // }
+
         let mut samples_to_skip = 0;
         if value.len() > max_frames_per_game {
             samples_to_skip = value.len() - max_frames_per_game;
         }
 
-        self.game_state.extend(other.game_state.drain(..).skip(samples_to_skip));
-        self.selected_policy.extend(other.selected_policy.drain(..).skip(samples_to_skip));
+        self.game_state
+            .extend(other.game_state.drain(..).skip(samples_to_skip));
+        self.selected_policy
+            .extend(other.selected_policy.drain(..).skip(samples_to_skip));
         self.invalid_move_mask
             .extend(other.invalid_move_mask.drain(..).skip(samples_to_skip));
-        self.target_value.extend(value.into_iter().skip(samples_to_skip));
-        self.gae.extend(gae_values.into_iter().skip(samples_to_skip));
+        self.target_value
+            .extend(value.into_iter().skip(samples_to_skip));
+        self.gae
+            .extend(gae_values.into_iter().skip(samples_to_skip));
 
         other.playing.clear();
 

@@ -13,7 +13,7 @@ pub const GAMES_PER_AI_SIMULATION: usize = 100;
 
 /// The number of frames we're shooting for when generating training data in a
 /// whole batch. It isn't an exact target.
-pub const TARGET_FRAMES_PER_BATCH: usize = 28_000;
+pub const TARGET_FRAMES_PER_BATCH: usize = 32_000;
 
 /// The number of turns after which we cancel a game.
 pub const MAX_TURNS_PER_GAME: usize = 2000;
@@ -43,4 +43,4 @@ pub const LAMBDA: f64 = 0.75;
 pub const MAX_SEQ_LENGTH: i64 = 2 * 11;
 
 pub const WIN_RATE_TO_FLIP_SIDES: f64 = 75.0;
-pub const WIN_RATE_SMOOTHING_FACTOR: f64 = 0.95;
+pub const WIN_RATE_SMOOTHING_FACTOR: f64 = 0.667;

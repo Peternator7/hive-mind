@@ -1,14 +1,17 @@
 use std::sync::OnceLock;
 
+use hive_engine::movement::Move;
 use opentelemetry::{
     metrics::{Counter, Gauge, Histogram},
-    InstrumentationScope,
+    InstrumentationScope, KeyValue,
 };
 use opentelemetry_otlp::WithExportConfig;
+use opentelemetry_sdk::metrics::Temporality;
 
 pub fn init_meter_provider() -> opentelemetry_sdk::metrics::SdkMeterProvider {
     let exporter = opentelemetry_otlp::MetricExporter::builder()
         .with_http()
+        .with_temporality(Temporality::Cumulative)
         .with_protocol(opentelemetry_otlp::Protocol::HttpBinary) //can be changed to `Protocol::HttpJson` to export in JSON format
         .build()
         .expect("Failed to create metric exporter");
@@ -79,6 +82,48 @@ pub fn increment_games_played() {
     });
 
     metric.add(1, &[]);
+}
+
+pub fn increment_move_made(mv: Move) {
+    static METRIC: OnceLock<Counter<u64>> = OnceLock::new();
+
+    let metric = METRIC.get_or_init(|| {
+        let scope = InstrumentationScope::builder("training")
+            .with_version("1.0")
+            .build();
+
+        let meter = opentelemetry::global::meter_with_scope(scope);
+
+        meter
+            .u64_counter("moves_made_total")
+            .with_description("a counter for every move the model makes")
+            .build()
+    });
+
+    let mv_type = match mv {
+        Move::MovePiece { .. } => "move_piece",
+        Move::PlacePiece { .. } => "place_piece",
+        Move::Pass => "pass",
+    };
+
+    let piece = match mv {
+        Move::MovePiece { piece, .. } | Move::PlacePiece { piece, .. } => match piece.role {
+            hive_engine::piece::Insect::Grasshopper => "grasshopper",
+            hive_engine::piece::Insect::QueenBee => "queen_bee",
+            hive_engine::piece::Insect::Beetle => "beetle",
+            hive_engine::piece::Insect::Spider => "spider",
+            hive_engine::piece::Insect::SoldierAnt => "soldier_ant",
+        },
+        Move::Pass => "none",
+    };
+
+    metric.add(
+        1,
+        &[
+            KeyValue::new("move_type", mv_type),
+            KeyValue::new("piece", piece),
+        ],
+    );
 }
 
 pub fn increment_games_finished() {
@@ -172,9 +217,7 @@ pub fn record_game_duration(game_duration: f64) {
 
         let meter = opentelemetry::global::meter_with_scope(scope);
 
-        let boundaries = vec![
-            0.00, 0.05, 0.10, 0.20, 0.25, 0.50, 0.75, 1.00, 1.25, 1.50, 2.00,
-        ];
+        let boundaries = (0..100).map(|i| 0.05 * i as f64).collect::<Vec<_>>();
 
         meter
             .f64_histogram("game_duration")
@@ -185,6 +228,26 @@ pub fn record_game_duration(game_duration: f64) {
     });
 
     metric.record(game_duration, &[]);
+}
+
+pub fn record_training_duration(duration: f64) {
+    static METRIC: OnceLock<Gauge<f64>> = OnceLock::new();
+
+    let metric = METRIC.get_or_init(|| {
+        let scope = InstrumentationScope::builder("training")
+            .with_version("1.0")
+            .build();
+
+        let meter = opentelemetry::global::meter_with_scope(scope);
+
+        meter
+            .f64_gauge("training_duration")
+            .with_description("the wall clock duration of a game.")
+            .with_unit("s")
+            .build()
+    });
+
+    metric.record(duration, &[]);
 }
 
 pub fn record_data_generation_duration(duration: f64) {

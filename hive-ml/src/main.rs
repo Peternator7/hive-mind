@@ -27,9 +27,9 @@ pub fn main() -> Result<(), Box<dyn Error>> {
     let device = tch::Device::cuda_if_available();
     let provider = metrics::init_meter_provider();
 
-    let mut vs = nn::VarStore::new(device);
+    let vs = nn::VarStore::new(device);
     let model = Mutex::new(HiveModel::new(&vs.root()));
-    vs.load("models/epoch_240")?;
+    // vs.load("models/epoch_240")?;
 
     let mut opponent_vs = nn::VarStore::new(device);
     let opponent = Mutex::new(HiveModel::new(&opponent_vs.root()));
@@ -52,7 +52,6 @@ pub fn main() -> Result<(), Box<dyn Error>> {
 
     println!("Starting train loop");
     for epoch in 1..251 {
-
         metrics::record_epoch(epoch);
 
         let st = Instant::now();
@@ -159,16 +158,20 @@ pub fn main() -> Result<(), Box<dyn Error>> {
         let win_rate = games_won.load(std::sync::atomic::Ordering::Relaxed) as f64
             / games_finished.load(std::sync::atomic::Ordering::Relaxed) as f64;
 
+        let model_win_rate = games_won_by_model.load(std::sync::atomic::Ordering::Relaxed) as f64
+            / games_finished.load(std::sync::atomic::Ordering::Relaxed) as f64;
+
         // if model_plays_as == Color::Black {
         //     win_rate = 100.0 - win_rate;
         // }
 
         println!(
-            "Epoch: {}, Played: {}, Finished: {}, WR: {:.2}, Time: {:.2}s, Frames: {}, P50 Turns: {:.0}, P80 Turns: {:.0}, P99 Turns: {:.0}",
+            "Epoch: {}, Played: {}, Finished: {}, WR: {:.2}, MWR: {:.2}, Time: {:.2}s, Frames: {}, P50 Turns: {:.0}, P80 Turns: {:.0}, P99 Turns: {:.0}",
             epoch,
             games_played.load(std::sync::atomic::Ordering::Relaxed),
             games_finished.load(std::sync::atomic::Ordering::Relaxed),
             100.0 * win_rate,
+            100.0 * model_win_rate,
             (Instant::now() - st).as_secs_f32(),
             frames.len(),
             percentiles[0],
@@ -316,6 +319,7 @@ pub fn main() -> Result<(), Box<dyn Error>> {
                 100.0 * white_won as f64 / (white_won + black_won) as f64,
             );
 
+            metrics::record_training_duration((Instant::now() - st).as_secs_f64());
             println!(
                 "Vs Random, Wins (new): {}, Wins (random): {}, Ties: {}, Time: {:.2}s",
                 white_won,
@@ -420,6 +424,8 @@ fn play_game_to_end(
             samples
                 .selected_policy
                 .push(sampled_action_idx.view(1i64).to(tch::Device::Cpu));
+
+            metrics::increment_move_made(*mv);
         }
     }
 
@@ -506,5 +512,6 @@ fn _train_loop(adam: &mut Optimizer, model: &mut HiveModel, frames: &MultipleGam
 
     adam.zero_grad();
 
+    metrics::record_training_batches(batch_count);
     batch_count as usize
 }

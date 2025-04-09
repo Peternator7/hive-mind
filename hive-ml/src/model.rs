@@ -4,65 +4,80 @@ use tch::{nn, Tensor};
 pub struct HiveModel {
     pub device: tch::Device,
     train_mode: bool,
-    shared_layers: tch::nn::SequentialT,
+    conv_i: tch::nn::Conv2D,
+    bn_i: tch::nn::BatchNorm,
+    residual_blocks: Vec<(tch::nn::Conv2D, tch::nn::BatchNorm)>,
     policy_layer: tch::nn::Sequential,
     value_layer: tch::nn::Sequential,
 }
 
 impl HiveModel {
     pub fn new(p: &nn::Path) -> Self {
-        let stride = |s| nn::ConvConfig {
-            stride: s,
-            ..Default::default()
-        };
+        const NUM_BLOCKS: usize = 9;
 
-        let i = INPUT_ENCODED_DIMS as i64;
-        let shared_layers = nn::seq_t()
-            // First two layers are 16 channel convolution
-            .add(nn::conv2d(p / "c1", i, 16, 5, Default::default()))
-            .add(nn::batch_norm2d(p / "b1", 16, Default::default()))
-            .add_fn(|xs| xs.relu())
-            .add_fn(|xs| xs.max_pool2d_default(2))
-            .add(nn::conv2d(p / "c2", 16, 32, 5, stride(1)))
-            .add(nn::batch_norm2d(p / "b2", 32, Default::default()))
-            .add_fn(|xs| xs.relu())
-            // Max pool and then 32 channel convolutions
-            // .add_fn(|xs| xs.max_pool2d_default(2))
-            .add(nn::conv2d(p / "c3", 32, 64, 5, stride(1)))
-            .add(nn::batch_norm2d(p / "b3", 64, Default::default()))
-            .add_fn(|xs| xs.relu())
-            .add(nn::conv2d(p / "c4", 64, 1024, 3, stride(1)))
-            .add(nn::batch_norm2d(p / "b4", 1024, Default::default()))
-            .add_fn(|xs| xs.relu())
-            // Max pool and then flatten.
-            // .add_fn(|xs| xs.max_pool2d_default(2))
-            .add_fn(|xs| xs.flat_view())
-            // .add_fn(|xs| xs.relu().flat_view())
-            .add(nn::linear(p / "l1", 1024, 1024, Default::default()))
-            .add_fn(|xs| xs.relu())
-            .add(nn::linear(p / "l2", 1024, 1024, Default::default()))
-            .add_fn(|xs| xs.relu());
+        // let stride = |s| nn::ConvConfig {
+        //     stride: s,
+        //     ..Default::default()
+        //};
+
+        let input_encoded_dims = INPUT_ENCODED_DIMS as i64;
+        let channels = 16;
+
+        let conv_i = tch::nn::conv2d(
+            p / "l0" / "conv",
+            input_encoded_dims,
+            channels,
+            3,
+            tch::nn::ConvConfig {
+                padding: 1,
+                ..Default::default()
+            },
+        );
+
+        let bn_i = tch::nn::batch_norm2d(p / "l0" / "bn", channels, Default::default());
+
+        let residual_blocks = (1..=NUM_BLOCKS)
+            .map(|idx| {
+                let layer = format!("l{}", idx);
+
+                let conv_layer = tch::nn::conv2d(
+                    p / layer.as_str() / "conv",
+                    channels,
+                    channels,
+                    3,
+                    tch::nn::ConvConfig {
+                        padding: 1,
+                        ..Default::default()
+                    },
+                );
+
+                let bn_layer = tch::nn::batch_norm2d(
+                    p / layer.as_str() / "conv",
+                    channels,
+                    Default::default(),
+                );
+
+                (conv_layer, bn_layer)
+            })
+            .collect::<Vec<_>>();
 
         let value_layer = nn::seq()
-            .add(nn::linear(p / "c1", 1024, 512, Default::default()))
-            .add_fn(|xs| xs.relu())
-            .add(nn::linear(p / "c2", 512, 1, Default::default()))
+            .add(nn::linear(p / "c2", 2704, 1, Default::default()))
             .add_fn(|xs| xs.sigmoid() - 0.5);
 
-        let policy_layer = nn::seq()
-            .add(nn::linear(p / "a1", 1024, 512, Default::default()))
-            .add_fn(|xs| xs.relu())
-            .add(nn::linear(
-                p / "a2",
-                512,
-                OUTPUT_LENGTH as i64,
-                Default::default(),
-            ));
+        let policy_layer = nn::seq().add(nn::linear(
+            p / "a2",
+            2704,
+            OUTPUT_LENGTH as i64,
+            Default::default(),
+        ));
 
         Self {
-            shared_layers,
             policy_layer,
             value_layer,
+            conv_i,
+            bn_i,
+            residual_blocks,
             train_mode: false,
             device: p.device(),
         }
@@ -83,6 +98,15 @@ impl HiveModel {
     }
 
     fn shared_layers(&self, game_state: &Tensor) -> Tensor {
-        game_state.apply_t(&self.shared_layers, self.train_mode)
+        let mut output = game_state.apply(&self.conv_i);
+        output = output.apply_t(&self.bn_i, self.train_mode);
+        output = output.max_pool2d_default(2);
+
+        for (c, bn) in &self.residual_blocks {
+            output = &output + output.apply(c);
+            output = output.apply_t(bn, self.train_mode).relu();
+        }
+
+        output.flat_view()
     }
 }

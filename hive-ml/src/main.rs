@@ -26,21 +26,25 @@ use tch::{nn, IndexOp, Kind, Tensor};
 pub fn main() -> Result<(), Box<dyn Error>> {
     let device = tch::Device::cuda_if_available();
     let provider = metrics::init_meter_provider();
+    metrics::record_training_start_time();
+    metrics::record_training_status(true);
 
     let vs = nn::VarStore::new(device);
     let model = Mutex::new(HiveModel::new(&vs.root()));
-    // vs.load("models/epoch_240")?;
+    // vs.load("models/epoch_120")?;
 
+    let opponent = &model;
     let mut opponent_vs = nn::VarStore::new(device);
-    let opponent = Mutex::new(HiveModel::new(&opponent_vs.root()));
-    opponent_vs.copy(&vs)?;
+    // let opponent = Mutex::new(HiveModel::new(&opponent_vs.root()));
+    // opponent_vs.copy(&vs)?;
 
     let mut lr = hypers::INITIAL_LEARNING_RATE;
+    let mut entropy_loss_factor = hypers::ENTROPY_LOSS_RATIO;
     let mut consecutive_epochs_with_less_than_05_training_steps = 0;
     let mut consecutive_epochs_with_more_than_20_training_steps = 0;
     let max_frames_per_game = hypers::MAX_FRAMES_PER_GAME;
 
-    // vs.save("models/epoch_0")?;
+    vs.save("models/epoch_0")?;
 
     let frames = Mutex::new(MultipleGames::default());
     let quantiles = Tensor::from_slice(&[0.5f32, 0.8f32, 0.99f32]);
@@ -58,6 +62,10 @@ pub fn main() -> Result<(), Box<dyn Error>> {
         let games_played = &AtomicUsize::new(0);
         let games_won = &AtomicUsize::new(0);
         let games_won_by_model = &AtomicUsize::new(0);
+        let games_played_white_model = &AtomicUsize::new(0);
+        let games_won_white_model = &AtomicUsize::new(0);
+        let games_played_black_model = &AtomicUsize::new(0);
+        let games_won_black_model = &AtomicUsize::new(0);
         let games_lengths: &Mutex<Vec<f32>> = &Mutex::new(Vec::new());
         let games_finished = &AtomicUsize::new(0);
         let distribution = rand::distributions::Bernoulli::new(1.0 - rolling_win_rate).unwrap();
@@ -78,17 +86,19 @@ pub fn main() -> Result<(), Box<dyn Error>> {
                             if distribution.sample(&mut rng) {
                                 model_plays_as = Color::White;
                                 white_model = &model;
-                                black_model = &opponent;
+                                black_model = opponent;
+                                games_played_white_model.fetch_add(1, Ordering::Relaxed);
                             } else {
                                 model_plays_as = Color::Black;
-                                white_model = &opponent;
+                                white_model = opponent;
                                 black_model = &model;
+                                games_played_black_model.fetch_add(1, Ordering::Relaxed);
                             };
 
                             let mut game = Game::new();
                             let game_start_time = Instant::now();
                             games_played.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            metrics::increment_games_played();
+                            metrics::increment_games_played(model_plays_as);
 
                             let winner = match play_game_to_end(
                                 &mut game,
@@ -106,22 +116,27 @@ pub fn main() -> Result<(), Box<dyn Error>> {
                             };
 
                             let elapsed = Instant::now() - game_start_time;
-                            metrics::record_game_duration(elapsed.as_secs_f64());
+                            metrics::record_game_duration(elapsed.as_secs_f64(), model_plays_as);
 
                             if winner == Some(Color::White) {
                                 games_won.fetch_add(1, Ordering::Relaxed);
-                                metrics::increment_white_side_won();
                             }
 
                             if winner == Some(model_plays_as) {
                                 games_won_by_model.fetch_add(1, Ordering::Relaxed);
-                                metrics::increment_model_won();
+                                metrics::increment_model_won(model_plays_as);
+
+                                if model_plays_as == Color::White {
+                                    games_won_white_model.fetch_add(1, Ordering::Relaxed);
+                                } else {
+                                    games_won_black_model.fetch_add(1, Ordering::Relaxed);
+                                }
                             }
 
-                            metrics::increment_games_finished();
+                            metrics::increment_games_finished(model_plays_as, winner);
                             games_finished.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-                            metrics::record_game_turns(game.turn());
+                            metrics::record_game_turns(game.turn(), model_plays_as);
                             games_lengths.lock().unwrap().push(game.turn() as f32);
 
                             let mut frames = frames.lock().unwrap();
@@ -181,18 +196,27 @@ pub fn main() -> Result<(), Box<dyn Error>> {
 
         metrics::record_data_generation_duration((Instant::now() - st).as_secs_f64());
 
-        rolling_win_rate = hypers::WIN_RATE_SMOOTHING_FACTOR * rolling_win_rate
-            + (1.0 - hypers::WIN_RATE_SMOOTHING_FACTOR) * win_rate;
-        // if rolling_win_rate >= hypers::WIN_RATE_TO_FLIP_SIDES {
-        //     model_plays_as = model_plays_as.opposing();
+        let white_win_rate = games_won_white_model.load(Ordering::Relaxed) as f64
+            / games_played_white_model.load(Ordering::Relaxed) as f64;
 
-        //     println!(
-        //         "WR Threshold Exceeded, WR: {}%. Now Playing as: {}",
-        //         rolling_win_rate, model_plays_as
-        //     );
-        //     opponent_vs.copy(&vs)?;
-        //     rolling_win_rate = 0.0;
-        // }
+        let black_win_rate = games_won_black_model.load(Ordering::Relaxed) as f64
+            / games_played_black_model.load(Ordering::Relaxed) as f64;
+
+        // The model can learn a strategy that works better from one side or the other.
+        // Since white goes first, it's typically from the white side so we use the ratio between the win
+        // rate of white and black to decide which color we should play more of.
+        let modified_win_rate = white_win_rate / (white_win_rate + black_win_rate);
+
+        rolling_win_rate = hypers::WIN_RATE_SMOOTHING_FACTOR * rolling_win_rate
+            + (1.0 - hypers::WIN_RATE_SMOOTHING_FACTOR) * modified_win_rate;
+
+        if (rolling_win_rate - 0.5).abs() > 0.05 {
+            entropy_loss_factor *= 1.10;
+            entropy_loss_factor = entropy_loss_factor.min(hypers::MAX_ENTROPY_LOSS_RATIO);
+        } else {
+            entropy_loss_factor *= 0.975;
+            entropy_loss_factor = entropy_loss_factor.max(hypers::MIN_ENTROPY_LOSS_RATIO);
+        }
 
         // Do a training loop.
         let st = Instant::now();
@@ -201,8 +225,14 @@ pub fn main() -> Result<(), Box<dyn Error>> {
         // from batch to batch.
         let mut adam = nn::Adam::default().build(&vs, lr).unwrap();
         metrics::record_learning_rate(lr);
+        metrics::record_entropy_loss_scale(entropy_loss_factor);
 
-        let train_steps = _train_loop(&mut adam, &mut *model.lock().unwrap(), &*frames);
+        let train_steps = _train_loop(
+            &mut adam,
+            &mut *model.lock().unwrap(),
+            &*frames,
+            entropy_loss_factor,
+        );
 
         if train_steps < 5 {
             consecutive_epochs_with_less_than_05_training_steps += 1;
@@ -215,24 +245,25 @@ pub fn main() -> Result<(), Box<dyn Error>> {
             consecutive_epochs_with_more_than_20_training_steps = 0;
         }
 
-        if consecutive_epochs_with_less_than_05_training_steps > 5 {
-            consecutive_epochs_with_less_than_05_training_steps = 0;
-            let old_lr = lr;
-            lr = hypers::MIN_LEARNING_RATE.max(lr * 0.800);
-            println!(
-                "Decreased Learning Rate, Old: {:.7}, New: {:.7}",
-                old_lr, lr
-            );
-        } else if consecutive_epochs_with_more_than_20_training_steps > 5 {
-            consecutive_epochs_with_more_than_20_training_steps = 0;
-            let old_lr = lr;
-            lr = hypers::INITIAL_LEARNING_RATE.min(lr * 1.1);
-            println!(
-                "Increased Learning Rate, Old: {:.7}, New: {:.7}",
-                old_lr, lr
-            );
-        }
+        // if consecutive_epochs_with_less_than_05_training_steps > 5 {
+        //     consecutive_epochs_with_less_than_05_training_steps = 0;
+        //     let old_lr = lr;
+        //     lr = hypers::MIN_LEARNING_RATE.max(lr * 0.800);
+        //     println!(
+        //         "Decreased Learning Rate, Old: {:.7}, New: {:.7}",
+        //         old_lr, lr
+        //     );
+        // } else if consecutive_epochs_with_more_than_20_training_steps > 5 {
+        //     consecutive_epochs_with_more_than_20_training_steps = 0;
+        //     let old_lr = lr;
+        //     lr = hypers::INITIAL_LEARNING_RATE.min(lr * 1.1);
+        //     println!(
+        //         "Increased Learning Rate, Old: {:.7}, New: {:.7}",
+        //         old_lr, lr
+        //     );
+        // }
 
+        metrics::record_training_duration((Instant::now() - st).as_secs_f64());
         println!(
             "Epoch: {}, Training Iteration Complete, Time Taken: {}s",
             epoch,
@@ -244,9 +275,11 @@ pub fn main() -> Result<(), Box<dyn Error>> {
         vs.save(format!("models/epoch_{0}", epoch))?;
 
         if epoch % 10 == 0 {
-            println!("Updating opponent to current model");
-            opponent_vs.copy(&vs)?;
-            metrics::increment_leveled_up_opponent();
+            // println!("Updating opponent to current model");
+            // opponent_vs.copy(&vs)?;
+            // metrics::increment_leveled_up_opponent();
+
+            lr = hypers::MIN_LEARNING_RATE.max(lr * 0.800);
 
             println!("Testing against initial model...");
             let mut old_vs = VarStore::new(device);
@@ -319,7 +352,6 @@ pub fn main() -> Result<(), Box<dyn Error>> {
                 100.0 * white_won as f64 / (white_won + black_won) as f64,
             );
 
-            metrics::record_training_duration((Instant::now() - st).as_secs_f64());
             println!(
                 "Vs Random, Wins (new): {}, Wins (random): {}, Ties: {}, Time: {:.2}s",
                 white_won,
@@ -330,6 +362,7 @@ pub fn main() -> Result<(), Box<dyn Error>> {
         }
     }
 
+    metrics::record_training_status(false);
     provider.shutdown()?;
     Ok(())
 }
@@ -385,9 +418,15 @@ fn play_game_to_end(
         valid_moves.clear();
         invalid_moves_mask.fill(true);
 
+        let playing = g.to_play();
+
         g.load_all_potential_moves(&mut valid_moves)?;
 
         if valid_moves.is_empty() {
+            if playing == training_model_color {
+                metrics::increment_move_made(Move::Pass, training_model_color);
+            }
+
             g.make_move(Move::Pass)?;
             consecutive_passes += 1;
             if consecutive_passes >= 6 {
@@ -399,7 +438,6 @@ fn play_game_to_end(
             consecutive_passes = 0;
         }
 
-        let playing = g.to_play();
         let curr_state = translate_game_to_conv_tensor(&g, playing);
         let curr_state_batch = curr_state.unsqueeze(0).to(device);
 
@@ -425,14 +463,19 @@ fn play_game_to_end(
                 .selected_policy
                 .push(sampled_action_idx.view(1i64).to(tch::Device::Cpu));
 
-            metrics::increment_move_made(*mv);
+            metrics::increment_move_made(*mv, training_model_color);
         }
     }
 
     Ok(winner)
 }
 
-fn _train_loop(adam: &mut Optimizer, model: &mut HiveModel, frames: &MultipleGames) -> usize {
+fn _train_loop(
+    adam: &mut Optimizer,
+    model: &mut HiveModel,
+    frames: &MultipleGames,
+    entropy_loss_scaling: f64,
+) -> usize {
     let state_buffer = Tensor::stack(frames.game_state.as_slice(), 0).to(model.device);
     let mask_buffer = Tensor::stack(frames.invalid_move_mask.as_slice(), 0).to(model.device);
     let selections_buffer = Tensor::stack(frames.selected_policy.as_slice(), 0).to(model.device);
@@ -462,20 +505,25 @@ fn _train_loop(adam: &mut Optimizer, model: &mut HiveModel, frames: &MultipleGam
             let idxs = perms.i((start as i64)..upper);
 
             let states = state_buffer.index_select(0, &idxs);
+            let mask = &mask_buffer.index_select(0, &idxs);
+
             let (values, mut policies) = model.value_policy(&states);
+            let _ = policies.masked_fill_(&mask, f64::NEG_INFINITY);
 
             let adv = gae_buffer.index_select(0, &idxs);
 
-            let logp = policies
-                .masked_fill_(&mask_buffer.index_select(0, &idxs), f64::NEG_INFINITY)
-                .log_softmax(1, None)
-                .gather(1, &selections_buffer.index_select(0, &idxs), false);
+            let logp = policies.log_softmax(1, None).gather(
+                1,
+                &selections_buffer.index_select(0, &idxs),
+                false,
+            );
 
             let logp_old = logp_old.index_select(0, &idxs);
 
             let ratio = (&logp - &logp_old).exp_();
             let clip_adv = ratio.clamp(1.0 - clip_ratio, 1.0 + clip_ratio) * &adv;
-            let pi_loss = (ratio * adv).minimum(&clip_adv).mean(None).neg();
+
+            let pi_loss = (ratio * adv).minimum(&clip_adv).mean(None);
 
             let value_loss = (values - target_value_buffer.index_select(0, &idxs))
                 .square()
@@ -483,7 +531,22 @@ fn _train_loop(adam: &mut Optimizer, model: &mut HiveModel, frames: &MultipleGam
 
             total_value_loss = tch::no_grad(|| total_value_loss + &value_loss);
             total_value_count += 1;
-            let loss: Tensor = value_loss + (hypers::PI_LOSS_RATIO * pi_loss);
+
+            let p_prob = policies.softmax(1, None) + 0.00001;
+            let h = mask.logical_not() * (&p_prob * p_prob.log());
+            let entropy_loss = h.sum_dim_intlist(1, false, None).neg().mean(None);
+
+            // Tensor::stack(&[&value_loss, &pi_loss, &entropy_loss], 0).print();
+
+            metrics::record_minibatch_statistics(
+                f64::try_from(&value_loss).unwrap(),
+                f64::try_from(&pi_loss).unwrap(),
+                f64::try_from(&entropy_loss).unwrap(),
+            );
+
+            let loss: Tensor = value_loss
+                - (hypers::PI_LOSS_RATIO * pi_loss)
+                - (entropy_loss_scaling * entropy_loss);
 
             let approx_kl: f32 = (logp_old - logp).mean(None).try_into().expect("success");
 

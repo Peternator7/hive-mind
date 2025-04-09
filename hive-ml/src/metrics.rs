@@ -1,12 +1,22 @@
 use std::sync::OnceLock;
 
-use hive_engine::movement::Move;
+use hive_engine::{movement::Move, piece::Color};
 use opentelemetry::{
     metrics::{Counter, Gauge, Histogram},
     InstrumentationScope, KeyValue,
 };
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::metrics::Temporality;
+
+fn scope() -> &'static InstrumentationScope {
+    static SCOPE: OnceLock<InstrumentationScope> = OnceLock::new();
+
+    SCOPE.get_or_init(|| {
+        InstrumentationScope::builder("training")
+            .with_version("1.0")
+            .build()
+    })
+}
 
 pub fn init_meter_provider() -> opentelemetry_sdk::metrics::SdkMeterProvider {
     let exporter = opentelemetry_otlp::MetricExporter::builder()
@@ -28,11 +38,7 @@ pub fn record_epoch(epoch: usize) {
     static METRIC: OnceLock<Gauge<u64>> = OnceLock::new();
 
     let metric = METRIC.get_or_init(|| {
-        let scope = InstrumentationScope::builder("training")
-            .with_version("1.0")
-            .build();
-
-        let meter = opentelemetry::global::meter_with_scope(scope);
+        let meter = opentelemetry::global::meter_with_scope(scope().clone());
 
         meter
             .u64_gauge("epoch")
@@ -44,15 +50,41 @@ pub fn record_epoch(epoch: usize) {
     metric.record(epoch as u64, &[]);
 }
 
+pub fn record_training_start_time() {
+    static METRIC: OnceLock<Gauge<f64>> = OnceLock::new();
+
+    let metric = METRIC.get_or_init(|| {
+        let meter = opentelemetry::global::meter_with_scope(scope().clone());
+
+        meter
+            .f64_gauge("train_start_time")
+            .with_description("training start time")
+            .build()
+    });
+
+    metric.record(chrono::Utc::now().timestamp() as f64, &[]);
+}
+
+pub fn record_training_status(is_training: bool) {
+    static METRIC: OnceLock<Gauge<f64>> = OnceLock::new();
+
+    let metric = METRIC.get_or_init(|| {
+        let meter = opentelemetry::global::meter_with_scope(scope().clone());
+
+        meter
+            .f64_gauge("is_training")
+            .with_description("Is the model currently training")
+            .build()
+    });
+
+    metric.record(if is_training { 1.0 } else { 0.0 }, &[]);
+}
+
 pub fn increment_leveled_up_opponent() {
     static METRIC: OnceLock<Counter<u64>> = OnceLock::new();
 
     let metric = METRIC.get_or_init(|| {
-        let scope = InstrumentationScope::builder("training")
-            .with_version("1.0")
-            .build();
-
-        let meter = opentelemetry::global::meter_with_scope(scope);
+        let meter = opentelemetry::global::meter_with_scope(scope().clone());
 
         meter
             .u64_counter("opponent_version_increased_total")
@@ -64,15 +96,11 @@ pub fn increment_leveled_up_opponent() {
     metric.add(1, &[]);
 }
 
-pub fn increment_games_played() {
+pub fn increment_games_played(model_color: Color) {
     static METRIC: OnceLock<Counter<u64>> = OnceLock::new();
 
     let metric = METRIC.get_or_init(|| {
-        let scope = InstrumentationScope::builder("training")
-            .with_version("1.0")
-            .build();
-
-        let meter = opentelemetry::global::meter_with_scope(scope);
+        let meter = opentelemetry::global::meter_with_scope(scope().clone());
 
         meter
             .u64_counter("games_played_total")
@@ -81,18 +109,52 @@ pub fn increment_games_played() {
             .build()
     });
 
-    metric.add(1, &[]);
+    let color = match model_color {
+        Color::Black => "black",
+        Color::White => "white",
+    };
+
+    metric.add(1, &[KeyValue::new("model_color", color)]);
 }
 
-pub fn increment_move_made(mv: Move) {
+pub fn increment_games_finished(model_color: Color, winner: Option<Color>) {
     static METRIC: OnceLock<Counter<u64>> = OnceLock::new();
 
     let metric = METRIC.get_or_init(|| {
-        let scope = InstrumentationScope::builder("training")
-            .with_version("1.0")
-            .build();
+        let meter = opentelemetry::global::meter_with_scope(scope().clone());
 
-        let meter = opentelemetry::global::meter_with_scope(scope);
+        meter
+            .u64_counter("games_finished_total")
+            .with_description("a counter for games finished.")
+            .with_unit("games")
+            .build()
+    });
+
+    let color = match model_color {
+        Color::Black => "black",
+        Color::White => "white",
+    };
+
+    let winner = match winner {
+        Some(Color::Black) => "black",
+        Some(Color::White) => "white",
+        None => "draw",
+    };
+
+    metric.add(
+        1,
+        &[
+            KeyValue::new("model_color", color),
+            KeyValue::new("winner", winner),
+        ],
+    );
+}
+
+pub fn increment_move_made(mv: Move, model_color: Color) {
+    static METRIC: OnceLock<Counter<u64>> = OnceLock::new();
+
+    let metric = METRIC.get_or_init(|| {
+        let meter = opentelemetry::global::meter_with_scope(scope().clone());
 
         meter
             .u64_counter("moves_made_total")
@@ -117,64 +179,26 @@ pub fn increment_move_made(mv: Move) {
         Move::Pass => "none",
     };
 
+    let color = match model_color {
+        Color::Black => "black",
+        Color::White => "white",
+    };
+
     metric.add(
         1,
         &[
             KeyValue::new("move_type", mv_type),
             KeyValue::new("piece", piece),
+            KeyValue::new("model_color", color),
         ],
     );
 }
 
-pub fn increment_games_finished() {
+pub fn increment_model_won(model_color: Color) {
     static METRIC: OnceLock<Counter<u64>> = OnceLock::new();
 
     let metric = METRIC.get_or_init(|| {
-        let scope = InstrumentationScope::builder("training")
-            .with_version("1.0")
-            .build();
-
-        let meter = opentelemetry::global::meter_with_scope(scope);
-
-        meter
-            .u64_counter("games_finished_total")
-            .with_description("a counter for games finished.")
-            .with_unit("games")
-            .build()
-    });
-
-    metric.add(1, &[]);
-}
-
-pub fn increment_white_side_won() {
-    static METRIC: OnceLock<Counter<u64>> = OnceLock::new();
-
-    let metric = METRIC.get_or_init(|| {
-        let scope = InstrumentationScope::builder("training")
-            .with_version("1.0")
-            .build();
-
-        let meter = opentelemetry::global::meter_with_scope(scope);
-
-        meter
-            .u64_counter("white_side_won_total")
-            .with_description("a counter for games won by the player with the white pieces.")
-            .with_unit("games")
-            .build()
-    });
-
-    metric.add(1, &[]);
-}
-
-pub fn increment_model_won() {
-    static METRIC: OnceLock<Counter<u64>> = OnceLock::new();
-
-    let metric = METRIC.get_or_init(|| {
-        let scope = InstrumentationScope::builder("training")
-            .with_version("1.0")
-            .build();
-
-        let meter = opentelemetry::global::meter_with_scope(scope);
+        let meter = opentelemetry::global::meter_with_scope(scope().clone());
 
         meter
             .u64_counter("model_won_total")
@@ -183,18 +207,19 @@ pub fn increment_model_won() {
             .build()
     });
 
-    metric.add(1, &[]);
+    let color = match model_color {
+        Color::Black => "black",
+        Color::White => "white",
+    };
+
+    metric.add(1, &[KeyValue::new("model_color", color)]);
 }
 
-pub fn record_game_turns(game_turns: usize) {
+pub fn record_game_turns(game_turns: usize, model_color: Color) {
     static METRIC: OnceLock<Histogram<u64>> = OnceLock::new();
 
     let metric = METRIC.get_or_init(|| {
-        let scope = InstrumentationScope::builder("training")
-            .with_version("1.0")
-            .build();
-
-        let meter = opentelemetry::global::meter_with_scope(scope);
+        let meter = opentelemetry::global::meter_with_scope(scope().clone());
 
         meter
             .u64_histogram("turns_played")
@@ -204,20 +229,21 @@ pub fn record_game_turns(game_turns: usize) {
             .build()
     });
 
-    metric.record(game_turns as u64, &[]);
+    let color = match model_color {
+        Color::Black => "black",
+        Color::White => "white",
+    };
+
+    metric.record(game_turns as u64, &[KeyValue::new("model_color", color)]);
 }
 
-pub fn record_game_duration(game_duration: f64) {
+pub fn record_game_duration(game_duration: f64, model_color: Color) {
     static METRIC: OnceLock<Histogram<f64>> = OnceLock::new();
 
     let metric = METRIC.get_or_init(|| {
-        let scope = InstrumentationScope::builder("training")
-            .with_version("1.0")
-            .build();
+        let meter = opentelemetry::global::meter_with_scope(scope().clone());
 
-        let meter = opentelemetry::global::meter_with_scope(scope);
-
-        let boundaries = (0..100).map(|i| 0.05 * i as f64).collect::<Vec<_>>();
+        let boundaries = (0..200).map(|i| 0.05 * i as f64).collect::<Vec<_>>();
 
         meter
             .f64_histogram("game_duration")
@@ -227,18 +253,19 @@ pub fn record_game_duration(game_duration: f64) {
             .build()
     });
 
-    metric.record(game_duration, &[]);
+    let color = match model_color {
+        Color::Black => "black",
+        Color::White => "white",
+    };
+
+    metric.record(game_duration, &[KeyValue::new("model_color", color)]);
 }
 
 pub fn record_training_duration(duration: f64) {
     static METRIC: OnceLock<Gauge<f64>> = OnceLock::new();
 
     let metric = METRIC.get_or_init(|| {
-        let scope = InstrumentationScope::builder("training")
-            .with_version("1.0")
-            .build();
-
-        let meter = opentelemetry::global::meter_with_scope(scope);
+        let meter = opentelemetry::global::meter_with_scope(scope().clone());
 
         meter
             .f64_gauge("training_duration")
@@ -254,11 +281,7 @@ pub fn record_data_generation_duration(duration: f64) {
     static METRIC: OnceLock<Gauge<f64>> = OnceLock::new();
 
     let metric = METRIC.get_or_init(|| {
-        let scope = InstrumentationScope::builder("training")
-            .with_version("1.0")
-            .build();
-
-        let meter = opentelemetry::global::meter_with_scope(scope);
+        let meter = opentelemetry::global::meter_with_scope(scope().clone());
 
         meter
             .f64_gauge("training_data_generation_duration")
@@ -274,11 +297,7 @@ pub fn record_learning_rate(lr: f64) {
     static METRIC: OnceLock<Gauge<f64>> = OnceLock::new();
 
     let metric = METRIC.get_or_init(|| {
-        let scope = InstrumentationScope::builder("training")
-            .with_version("1.0")
-            .build();
-
-        let meter = opentelemetry::global::meter_with_scope(scope);
+        let meter = opentelemetry::global::meter_with_scope(scope().clone());
 
         meter
             .f64_gauge("learning_rate")
@@ -289,15 +308,27 @@ pub fn record_learning_rate(lr: f64) {
     metric.record(lr, &[]);
 }
 
+pub fn record_entropy_loss_scale(lr: f64) {
+    static METRIC: OnceLock<Gauge<f64>> = OnceLock::new();
+
+    let metric = METRIC.get_or_init(|| {
+        let meter = opentelemetry::global::meter_with_scope(scope().clone());
+
+        meter
+            .f64_gauge("entropy_loss_scale")
+            .with_description("the scale factor for entropy loss")
+            .build()
+    });
+
+    metric.record(lr, &[]);
+}
+
+
 pub fn record_value_mse(mse: f64) {
     static METRIC: OnceLock<Gauge<f64>> = OnceLock::new();
 
     let metric = METRIC.get_or_init(|| {
-        let scope = InstrumentationScope::builder("training")
-            .with_version("1.0")
-            .build();
-
-        let meter = opentelemetry::global::meter_with_scope(scope);
+        let meter = opentelemetry::global::meter_with_scope(scope().clone());
 
         meter
             .f64_gauge("value_fn_mse")
@@ -312,11 +343,7 @@ pub fn record_training_batches(batch_count: usize) {
     static METRIC: OnceLock<Gauge<u64>> = OnceLock::new();
 
     let metric = METRIC.get_or_init(|| {
-        let scope = InstrumentationScope::builder("training")
-            .with_version("1.0")
-            .build();
-
-        let meter = opentelemetry::global::meter_with_scope(scope);
+        let meter = opentelemetry::global::meter_with_scope(scope().clone());
 
         meter
             .u64_gauge("training_batch_count")
@@ -331,11 +358,7 @@ pub fn record_win_rate_vs_initial(win_rate: f64) {
     static METRIC: OnceLock<Gauge<f64>> = OnceLock::new();
 
     let metric = METRIC.get_or_init(|| {
-        let scope = InstrumentationScope::builder("training")
-            .with_version("1.0")
-            .build();
-
-        let meter = opentelemetry::global::meter_with_scope(scope);
+        let meter = opentelemetry::global::meter_with_scope(scope().clone());
 
         meter
             .f64_gauge("win_rate_vs_random")
@@ -344,4 +367,52 @@ pub fn record_win_rate_vs_initial(win_rate: f64) {
     });
 
     metric.record(win_rate, &[]);
+}
+
+pub fn record_minibatch_statistics(value_loss: f64, policy_loss: f64, entropy_loss: f64) {
+    static TRAINING_ITERATIONS_COUNT_TOTAL: OnceLock<Counter<u64>> = OnceLock::new();
+    static TRAINING_VALUE_LOSS_TOTAL: OnceLock<Counter<f64>> = OnceLock::new();
+    static TRAINING_POLICY_LOSS_TOTAL: OnceLock<Counter<f64>> = OnceLock::new();
+    static TRAINING_ENTROPY_LOSS_TOTAL: OnceLock<Counter<f64>> = OnceLock::new();
+
+    let training_iterations_count_total = TRAINING_ITERATIONS_COUNT_TOTAL.get_or_init(|| {
+        let meter = opentelemetry::global::meter_with_scope(scope().clone());
+
+        meter
+            .u64_counter("training_iterations_count_total")
+            .with_description("a counter for the number of training iterations run.")
+            .build()
+    });
+
+    let training_value_loss_total = TRAINING_VALUE_LOSS_TOTAL.get_or_init(|| {
+        let meter = opentelemetry::global::meter_with_scope(scope().clone());
+
+        meter
+            .f64_counter("training_value_loss_total")
+            .with_description("a counter for the total value loss during training.")
+            .build()
+    });
+
+    let training_policy_loss_total = TRAINING_POLICY_LOSS_TOTAL.get_or_init(|| {
+        let meter = opentelemetry::global::meter_with_scope(scope().clone());
+
+        meter
+            .f64_counter("training_policy_loss_total")
+            .with_description("a counter for the total policy loss during training.")
+            .build()
+    });
+
+    let training_entropy_loss_total = TRAINING_ENTROPY_LOSS_TOTAL.get_or_init(|| {
+        let meter = opentelemetry::global::meter_with_scope(scope().clone());
+
+        meter
+            .f64_counter("training_entropy_loss_total")
+            .with_description("a counter for the total entropy loss during training.")
+            .build()
+    });
+
+    training_iterations_count_total.add(1, &[]);
+    training_value_loss_total.add(value_loss, &[]);
+    training_policy_loss_total.add(policy_loss, &[]);
+    training_entropy_loss_total.add(entropy_loss, &[]);
 }

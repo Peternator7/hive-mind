@@ -7,6 +7,7 @@ edition = "2021"
 tch = "0.19.0"
 hive-engine = { path = "../hive-engine" }
 rand = "*"
+chrono = "*"
 opentelemetry = "*"
 opentelemetry_sdk = "*"
 opentelemetry-otlp = "*"

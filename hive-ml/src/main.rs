@@ -30,18 +30,16 @@ pub fn main() -> Result<(), Box<dyn Error>> {
     metrics::record_training_status(true);
 
     let vs = nn::VarStore::new(device);
-    let model = Mutex::new(HiveModel::new(&vs.root()));
-    // vs.load("models/epoch_120")?;
+    let model = &Mutex::new(HiveModel::new(&vs.root()));
+    // vs.load("models/epoch_10")?;
 
-    let opponent = &model;
+    // let opponent = &model;
     let mut opponent_vs = nn::VarStore::new(device);
-    // let opponent = Mutex::new(HiveModel::new(&opponent_vs.root()));
-    // opponent_vs.copy(&vs)?;
+    let _opponent = &Mutex::new(HiveModel::new(&opponent_vs.root()));
+    opponent_vs.copy(&vs)?;
 
     let mut lr = hypers::INITIAL_LEARNING_RATE;
     let mut entropy_loss_factor = hypers::ENTROPY_LOSS_RATIO;
-    let mut consecutive_epochs_with_less_than_05_training_steps = 0;
-    let mut consecutive_epochs_with_more_than_20_training_steps = 0;
     let max_frames_per_game = hypers::MAX_FRAMES_PER_GAME;
 
     vs.save("models/epoch_0")?;
@@ -74,6 +72,14 @@ pub fn main() -> Result<(), Box<dyn Error>> {
             let handles = (0..hypers::PARALLEL_GAMES)
                 .map(|_| {
                     scope.spawn(|| {
+                        let mut local_vs = nn::VarStore::new(device);
+                        let local_model = Mutex::new(HiveModel::new(&local_vs.root()));
+                        local_vs.copy(&vs).unwrap();
+
+                        let mut local_opponent_vs = nn::VarStore::new(device);
+                        let local_opponent = Mutex::new(HiveModel::new(&local_opponent_vs.root()));
+                        local_opponent_vs.copy(&opponent_vs).unwrap();
+
                         let mut rng = rand::thread_rng();
                         let samples = &mut SingleGame::default();
                         assert!(samples.validate_buffers());
@@ -85,13 +91,13 @@ pub fn main() -> Result<(), Box<dyn Error>> {
                             let black_model;
                             if distribution.sample(&mut rng) {
                                 model_plays_as = Color::White;
-                                white_model = &model;
-                                black_model = opponent;
+                                white_model = &local_model;
+                                black_model = &local_opponent;
                                 games_played_white_model.fetch_add(1, Ordering::Relaxed);
                             } else {
                                 model_plays_as = Color::Black;
-                                white_model = opponent;
-                                black_model = &model;
+                                white_model = &local_opponent;
+                                black_model = &local_model;
                                 games_played_black_model.fetch_add(1, Ordering::Relaxed);
                             };
 
@@ -110,6 +116,7 @@ pub fn main() -> Result<(), Box<dyn Error>> {
                                 Ok(winner) => winner,
                                 Err(HiveError::TurnLimitHit) => {
                                     samples.clear();
+                                    metrics::increment_games_finished(model_plays_as, None, true);
                                     continue;
                                 }
                                 Err(e) => return Err(e),
@@ -133,7 +140,7 @@ pub fn main() -> Result<(), Box<dyn Error>> {
                                 }
                             }
 
-                            metrics::increment_games_finished(model_plays_as, winner);
+                            metrics::increment_games_finished(model_plays_as, winner, false);
                             games_finished.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
                             metrics::record_game_turns(game.turn(), model_plays_as);
@@ -147,6 +154,8 @@ pub fn main() -> Result<(), Box<dyn Error>> {
                                 hypers::LAMBDA,
                                 max_frames_per_game,
                             );
+
+                            metrics::record_frame_buffer_count(frames.len());
                         }
 
                         Result::<_, HiveError>::Ok(())
@@ -227,41 +236,12 @@ pub fn main() -> Result<(), Box<dyn Error>> {
         metrics::record_learning_rate(lr);
         metrics::record_entropy_loss_scale(entropy_loss_factor);
 
-        let train_steps = _train_loop(
+        _train_loop(
             &mut adam,
             &mut *model.lock().unwrap(),
             &*frames,
             entropy_loss_factor,
         );
-
-        if train_steps < 5 {
-            consecutive_epochs_with_less_than_05_training_steps += 1;
-            consecutive_epochs_with_more_than_20_training_steps = 0;
-        } else if train_steps > 20 {
-            consecutive_epochs_with_less_than_05_training_steps = 0;
-            consecutive_epochs_with_more_than_20_training_steps += 1;
-        } else {
-            consecutive_epochs_with_less_than_05_training_steps = 0;
-            consecutive_epochs_with_more_than_20_training_steps = 0;
-        }
-
-        // if consecutive_epochs_with_less_than_05_training_steps > 5 {
-        //     consecutive_epochs_with_less_than_05_training_steps = 0;
-        //     let old_lr = lr;
-        //     lr = hypers::MIN_LEARNING_RATE.max(lr * 0.800);
-        //     println!(
-        //         "Decreased Learning Rate, Old: {:.7}, New: {:.7}",
-        //         old_lr, lr
-        //     );
-        // } else if consecutive_epochs_with_more_than_20_training_steps > 5 {
-        //     consecutive_epochs_with_more_than_20_training_steps = 0;
-        //     let old_lr = lr;
-        //     lr = hypers::INITIAL_LEARNING_RATE.min(lr * 1.1);
-        //     println!(
-        //         "Increased Learning Rate, Old: {:.7}, New: {:.7}",
-        //         old_lr, lr
-        //     );
-        // }
 
         metrics::record_training_duration((Instant::now() - st).as_secs_f64());
         println!(
@@ -271,15 +251,16 @@ pub fn main() -> Result<(), Box<dyn Error>> {
         );
 
         frames.clear();
+        metrics::record_frame_buffer_count(frames.len());
 
         vs.save(format!("models/epoch_{0}", epoch))?;
 
         if epoch % 10 == 0 {
-            // println!("Updating opponent to current model");
-            // opponent_vs.copy(&vs)?;
-            // metrics::increment_leveled_up_opponent();
+            println!("Updating opponent to current model");
+            opponent_vs.copy(&vs)?;
+            metrics::increment_leveled_up_opponent();
 
-            lr = hypers::MIN_LEARNING_RATE.max(lr * 0.800);
+            lr = hypers::MIN_LEARNING_RATE.max(lr * hypers::LEARNING_RATE_DECAY);
 
             println!("Testing against initial model...");
             let mut old_vs = VarStore::new(device);

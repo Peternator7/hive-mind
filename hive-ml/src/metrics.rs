@@ -117,7 +117,7 @@ pub fn increment_games_played(model_color: Color) {
     metric.add(1, &[KeyValue::new("model_color", color)]);
 }
 
-pub fn increment_games_finished(model_color: Color, winner: Option<Color>) {
+pub fn increment_games_finished(model_color: Color, winner: Option<Color>, stalled: bool) {
     static METRIC: OnceLock<Counter<u64>> = OnceLock::new();
 
     let metric = METRIC.get_or_init(|| {
@@ -138,6 +138,7 @@ pub fn increment_games_finished(model_color: Color, winner: Option<Color>) {
     let winner = match winner {
         Some(Color::Black) => "black",
         Some(Color::White) => "white",
+        None if stalled => "stalled",
         None => "draw",
     };
 
@@ -225,7 +226,7 @@ pub fn record_game_turns(game_turns: usize, model_color: Color) {
             .u64_histogram("turns_played")
             .with_description("the number of turns in a game.")
             .with_unit("games")
-            .with_boundaries((0..100).map(|x| 20.0 * x as f64).collect::<Vec<_>>())
+            .with_boundaries((0..151).map(|x| 20.0 * x as f64).collect::<Vec<_>>())
             .build()
     });
 
@@ -243,7 +244,7 @@ pub fn record_game_duration(game_duration: f64, model_color: Color) {
     let metric = METRIC.get_or_init(|| {
         let meter = opentelemetry::global::meter_with_scope(scope().clone());
 
-        let boundaries = (0..200).map(|i| 0.05 * i as f64).collect::<Vec<_>>();
+        let boundaries = (0..400).map(|i| 0.05 * i as f64).collect::<Vec<_>>();
 
         meter
             .f64_histogram("game_duration")
@@ -259,6 +260,21 @@ pub fn record_game_duration(game_duration: f64, model_color: Color) {
     };
 
     metric.record(game_duration, &[KeyValue::new("model_color", color)]);
+}
+
+pub fn record_frame_buffer_count(frame_count: usize) {
+    static METRIC: OnceLock<Gauge<u64>> = OnceLock::new();
+
+    let metric = METRIC.get_or_init(|| {
+        let meter = opentelemetry::global::meter_with_scope(scope().clone());
+
+        meter
+            .u64_gauge("current_frame_buffer_count")
+            .with_description("the number of frames in the buffer")
+            .build()
+    });
+
+    metric.record(frame_count as u64, &[]);
 }
 
 pub fn record_training_duration(duration: f64) {
@@ -322,7 +338,6 @@ pub fn record_entropy_loss_scale(lr: f64) {
 
     metric.record(lr, &[]);
 }
-
 
 pub fn record_value_mse(mse: f64) {
     static METRIC: OnceLock<Gauge<f64>> = OnceLock::new();

@@ -102,6 +102,32 @@ pub fn translate_game_to_conv_tensor(game: &Game, perspective: Color) -> Tensor 
     t
 }
 
+pub fn translate_to_valid_absolute_moves_mask(
+    game: &Game,
+    valid_moves: &[Move],
+    playing: Color,
+    mask: &mut [bool],
+) -> HashMap<usize, Move> {
+    let mut map = HashMap::new();
+    mask.fill(true);
+
+    let dim = game.board().dims();
+    for mv in valid_moves {
+        let (plane, pos) = match mv {
+            Move::MovePiece { piece, to, .. } => (piece.encode(playing), to),
+            Move::PlacePiece { piece, position } => (piece.encode(playing), position),
+            Move::Pass => unreachable!(),
+        };
+
+        let idx = (pos.1 as usize) + (dim * (pos.0 as usize)) + (dim * dim * plane);
+
+        map.entry(idx).insert_entry(*mv);
+        mask[idx] = false;
+    }
+
+    map
+}
+
 pub fn translate_to_valid_moves_mask(
     game: &Game,
     valid_moves: &[Move],
@@ -117,9 +143,7 @@ pub fn translate_to_valid_moves_mask(
         // 22 pieces total on the board
         // 7 relative directions (6 hex directions + on top of)
 
-        22 * 7 * piece_idx
-        + 7 * adj_piece_idx
-        + relative_pos
+        22 * 7 * piece_idx + 7 * adj_piece_idx + relative_pos
     }
 
     for mv in valid_moves {

@@ -21,7 +21,7 @@ impl HiveModel {
         //};
 
         let input_encoded_dims = INPUT_ENCODED_DIMS as i64;
-        let channels = 16;
+        let channels = 32;
 
         let conv_i = tch::nn::conv2d(
             p / "l0" / "conv",
@@ -51,23 +51,20 @@ impl HiveModel {
                     },
                 );
 
-                let bn_layer = tch::nn::batch_norm2d(
-                    p / layer.as_str() / "conv",
-                    channels,
-                    Default::default(),
-                );
+                let bn_layer =
+                    tch::nn::batch_norm2d(p / layer.as_str() / "bn", channels, Default::default());
 
                 (conv_layer, bn_layer)
             })
             .collect::<Vec<_>>();
 
         let value_layer = nn::seq()
-            .add(nn::linear(p / "c2", 2704, 1, Default::default()))
-            .add_fn(|xs| xs.sigmoid() - 0.5);
+            .add(nn::linear(p / "c2", 1152, 1, Default::default()))
+            .add_fn(|xs| xs.tanh());
 
         let policy_layer = nn::seq().add(nn::linear(
             p / "a2",
-            2704,
+            1152,
             OUTPUT_LENGTH as i64,
             Default::default(),
         ));
@@ -103,10 +100,11 @@ impl HiveModel {
         output = output.max_pool2d_default(2);
 
         for (c, bn) in &self.residual_blocks {
-            output = &output + output.apply(c);
-            output = output.apply_t(bn, self.train_mode).relu();
+            output = &output + output.apply(c).relu();
+            output = output.apply_t(bn, self.train_mode);
         }
 
+        output = output.max_pool2d_default(2);
         output.flat_view()
     }
 }

@@ -91,8 +91,8 @@ impl MultipleGames {
 
         let mut gae = match winner {
             None => Tensor::from(0.0f32),
-            Some(Color::White) => Tensor::from(0.5f32),
-            Some(Color::Black) => Tensor::from(-0.5f32),
+            Some(Color::White) => Tensor::from(1.0f32),
+            Some(Color::Black) => Tensor::from(-1.0f32),
         };
 
         let mut discounted_rewards = gae.copy();

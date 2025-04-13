@@ -23,15 +23,23 @@ use tch::{nn, IndexOp, Kind, Tensor};
 // input data shape should be [batch, channels, rows, cols]
 // output data shape should be [batch, ]
 
+struct ModelData {
+    name: String,
+    vs: VarStore,
+    frames: MultipleGames,
+    model: Mutex<HiveModel>,
+}
+
 pub fn main() -> Result<(), Box<dyn Error>> {
     let device = tch::Device::cuda_if_available();
     let provider = metrics::init_meter_provider();
     metrics::record_training_start_time();
     metrics::record_training_status(true);
 
-    let vs = nn::VarStore::new(device);
+    let mut vs = nn::VarStore::new(device);
+    
     let model = &Mutex::new(HiveModel::new(&vs.root()));
-    // vs.load("models/epoch_10")?;
+    vs.load("models/epoch_180")?;
 
     // let opponent = &model;
     let mut opponent_vs = nn::VarStore::new(device);
@@ -255,11 +263,21 @@ pub fn main() -> Result<(), Box<dyn Error>> {
 
         vs.save(format!("models/epoch_{0}", epoch))?;
 
-        if epoch % 10 == 0 {
-            println!("Updating opponent to current model");
-            opponent_vs.copy(&vs)?;
-            metrics::increment_leveled_up_opponent();
+        if let Ok(env_var) = std::env::var("HIVE_OVERRIDE_LEARNING_RATE") {
+            println!("Learning Rate Override Variable Set");
+            if let Ok(value) = env_var.parse() {
+                println!("Learning Rate Override detected. New value: {}", value);
+                lr = value;
+            } else {
+                println!("Unable to parse learning rate. Env var {}", env_var);
+            }
+        }
 
+        println!("Updating opponent to current model");
+        opponent_vs.copy(&vs)?;
+        metrics::increment_leveled_up_opponent();
+
+        if epoch % 10 == 0 {
             lr = hypers::MIN_LEARNING_RATE.max(lr * hypers::LEARNING_RATE_DECAY);
 
             println!("Testing against initial model...");

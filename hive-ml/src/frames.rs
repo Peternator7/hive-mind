@@ -1,8 +1,5 @@
 use hive_engine::piece::Color;
-use rand::{
-    rngs::StdRng,
-    SeedableRng,
-};
+use rand::{rngs::StdRng, SeedableRng};
 use tch::Tensor;
 
 use crate::hypers;
@@ -88,6 +85,7 @@ impl MultipleGames {
         }
 
         let mut gae_values = Vec::with_capacity(value.len());
+        let mut distance_to_end = 0;
 
         let mut gae = match winner {
             None => Tensor::from(0.0f32),
@@ -104,12 +102,20 @@ impl MultipleGames {
                 continue;
             }
 
+            let x = distance_to_end - hypers::PENALIZE_TURNS_DISTANCE_FROM_END;
+            let x = x as f64;
+            let long_game_penalty: Tensor = 0.333 * Tensor::from(x / 2.0).sigmoid();
+
             let delta = gamma * &value[idx + 1] - &value[idx];
             value[idx + 1] = discounted_rewards.copy();
             discounted_rewards = discounted_rewards * gamma;
 
             gae = delta + gl * &gae;
-            gae_values.push(gae.copy());
+            // We apply an additional penalty for moves in very long running games.
+            // because there's a reasonable argument that they didn't accomplish very much.
+            gae_values.push((gae.copy() - long_game_penalty).clamp(-1.0, 1.0));
+
+            distance_to_end += 1;
         }
 
         value[0] = discounted_rewards;

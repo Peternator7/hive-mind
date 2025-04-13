@@ -183,20 +183,52 @@ pub fn translate_to_valid_moves_mask(
     map
 }
 
-pub fn translate_game_to_seq_tensor(game: &Game, perspective: Color) -> (Tensor, usize) {
-    let mut v = Vec::new();
-    let mut scratch = Vec::new();
-    for pos in game.board().enumerate_all_pieces() {
+pub fn translate_game_to_seq_tensor(game: &Game, perspective: Color) -> Tensor {
+    let d = hive_engine::BOARD_SIZE as i64;
+
+    let mut t = Tensor::zeros(&[hypers::INPUT_ENCODED_DIMS as i64, d * d], FLOAT_CPU);
+    let b = game.board();
+
+    let mut v = vec![0.0f32; hypers::INPUT_ENCODED_DIMS];
+    let mut pieces = Vec::new();
+
+    for pos in b.enumerate_all_pieces() {
         let mut height = 0;
-        scratch.extend(game.board().enumerate_all_pieces_on_tile(pos));
-        scratch.reverse();
-        for piece in scratch.drain(..) {
-            v.push((pos, piece, height));
-            height += 1;
+        pieces.extend(b.enumerate_all_pieces_on_tile(pos));
+        pieces.reverse();
+
+        for piece in pieces.drain(..) {
+            v[piece.encode(perspective)] = 1.0;
+
+            if piece.is_beetle() {
+                if height > 0 {
+                    let mut idx = 2 * Piece::PLANES_PER_COLOR + height - 1;
+                    if piece.color != perspective {
+                        idx += 4;
+                    }
+
+                    v[idx] = 1.0;
+                }
+
+                height += 1;
+            }
         }
+
+        let _ = t.index_put_(
+            &[
+                None,
+                Some(Tensor::from(pos.0 as i32)),
+                Some(Tensor::from(pos.1 as i32)),
+            ],
+            &Tensor::from_slice(&v),
+            false,
+        );
+
+        pieces.clear();
+        v.fill(0.0);
     }
 
-    translate_pieces_to_seq_tensor(&v, perspective)
+    t
 }
 
 pub fn translate_pieces_to_seq_tensor(

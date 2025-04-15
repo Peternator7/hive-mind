@@ -85,7 +85,7 @@ impl MultipleGames {
         }
 
         let mut gae_values = Vec::with_capacity(value.len());
-        let mut distance_to_end = 0;
+        // let mut distance_to_end = 0;
 
         let mut gae = match winner {
             None => Tensor::from(0.0f32),
@@ -102,9 +102,16 @@ impl MultipleGames {
                 continue;
             }
 
-            let x = distance_to_end - hypers::PENALIZE_TURNS_DISTANCE_FROM_END;
-            let x = x as f64;
-            let long_game_penalty: Tensor = 0.333 * Tensor::from(x / 2.0).sigmoid();
+            // let mut long_game_penalty: Tensor = {
+            //     let x = distance_to_end - hypers::PENALIZE_TURNS_DISTANCE_FROM_END;
+            //     let x = x as f64;
+            //     0.333 * Tensor::from(x / 2.0).sigmoid()
+            // };
+
+            // if idx < hypers::PENALIZE_TURNS_DISTANCE_FROM_END as usize {
+            //     let scale = idx as f64  / hypers::PENALIZE_TURNS_DISTANCE_FROM_END as f64;
+            //     long_game_penalty *= scale * scale;
+            // };
 
             let delta = gamma * &value[idx + 1] - &value[idx];
             value[idx + 1] = discounted_rewards.copy();
@@ -113,9 +120,9 @@ impl MultipleGames {
             gae = delta + gl * &gae;
             // We apply an additional penalty for moves in very long running games.
             // because there's a reasonable argument that they didn't accomplish very much.
-            gae_values.push((gae.copy() - long_game_penalty).clamp(-1.0, 1.0));
+            gae_values.push(gae.clamp(-1.0, 1.0));
 
-            distance_to_end += 1;
+            // distance_to_end += 1;
         }
 
         value[0] = discounted_rewards;
@@ -128,62 +135,9 @@ impl MultipleGames {
             }
         }
 
-        // if winner == Some(Color::White) {
-        //     max_frames_per_game /= 2;
-        // }
-
-        // let mut samples_to_skip = 0;
-        // if value.len() > max_frames_per_game {
-        //     samples_to_skip = value.len() - max_frames_per_game;
-        // }
-
-        // self.sample_buffer.clear();
-
-        // let frames_to_sample = value.len().min(max_frames_per_game);
-
-        // let indices = rand::seq::index::sample_weighted(
-        //     &mut self.rng,
-        //     value.len(),
-        //     |idx| idx as f64,
-        //     frames_to_sample,
-        // )
-        // .unwrap();
-
-        // self.sample_buffer.extend(indices.into_iter());
-        // self.sample_buffer.sort();
-
-        // let mut game_state_iter = other.game_state.drain(..);
-        // let mut selected_policy_iter = other.selected_policy.drain(..);
-        // let mut invalid_move_mask_iter = other.invalid_move_mask.drain(..);
-        // let mut value_iter = value.into_iter();
-        // let mut gae_iter = gae_values.into_iter();
-
-        // let mut samples_iter = self.sample_buffer.drain(..);
-        // let mut target = samples_iter.next();
-        // let mut curr_idx = 0;
-        // while let Some(target_idx) = target {
-        //     let game_state = game_state_iter.next().unwrap();
-        //     let selected_policy = selected_policy_iter.next().unwrap();
-        //     let invalid_move_mask = invalid_move_mask_iter.next().unwrap();
-        //     let value = value_iter.next().unwrap();
-        //     let gae = gae_iter.next().unwrap();
-
-        //     if curr_idx == target_idx {
-        //         self.game_state.push(game_state);
-        //         self.selected_policy.push(selected_policy);
-        //         self.invalid_move_mask.push(invalid_move_mask);
-        //         self.target_value.push(value);
-        //         self.gae.push(gae);
-        //         target = samples_iter.next();
-        //     }
-
-        //     curr_idx += 1;
-        // }
-        // drop(samples_iter);
-
         let mut samples_to_skip = 0;
-        if value.len() > max_frames_per_game {
-            samples_to_skip = value.len() - max_frames_per_game;
+        if value.len() > 2 * max_frames_per_game {
+            samples_to_skip = value.len() - 2 * max_frames_per_game;
         }
 
         self.game_state

@@ -96,28 +96,13 @@ pub fn increment_leveled_up_opponent() {
     metric.add(1, &[]);
 }
 
-pub fn increment_games_played(model_color: Color) {
-    static METRIC: OnceLock<Counter<u64>> = OnceLock::new();
-
-    let metric = METRIC.get_or_init(|| {
-        let meter = opentelemetry::global::meter_with_scope(scope().clone());
-
-        meter
-            .u64_counter("games_played_total")
-            .with_description("a counter for games started.")
-            .with_unit("games")
-            .build()
-    });
-
-    let color = match model_color {
-        Color::Black => "black",
-        Color::White => "white",
-    };
-
-    metric.add(1, &[KeyValue::new("model_color", color)]);
-}
-
-pub fn increment_games_finished(model_color: Color, winner: Option<Color>, stalled: bool) {
+pub fn increment_games_finished(
+    model_color: Color,
+    winner: Option<Color>,
+    stalled: bool,
+    model_name: &str,
+    opponent_name: &str,
+) {
     static METRIC: OnceLock<Counter<u64>> = OnceLock::new();
 
     let metric = METRIC.get_or_init(|| {
@@ -130,9 +115,9 @@ pub fn increment_games_finished(model_color: Color, winner: Option<Color>, stall
             .build()
     });
 
-    let color = match model_color {
-        Color::Black => "black",
-        Color::White => "white",
+    let (color, opponent_color) = match model_color {
+        Color::Black => ("black", "white"),
+        Color::White => ("white", "black"),
     };
 
     let winner = match winner {
@@ -147,11 +132,23 @@ pub fn increment_games_finished(model_color: Color, winner: Option<Color>, stall
         &[
             KeyValue::new("model_color", color),
             KeyValue::new("winner", winner),
+            KeyValue::new("model_name", model_name.to_string()),
+            KeyValue::new("opponent_name", opponent_name.to_string()),
+        ],
+    );
+
+    metric.add(
+        1,
+        &[
+            KeyValue::new("model_color", opponent_color),
+            KeyValue::new("winner", winner),
+            KeyValue::new("model_name", opponent_name.to_string()),
+            KeyValue::new("opponent_name", model_name.to_string()),
         ],
     );
 }
 
-pub fn increment_move_made(mv: Move, model_color: Color) {
+pub fn increment_move_made(mv: Move, model_color: Color, model_name: &str, opponent_name: &str) {
     static METRIC: OnceLock<Counter<u64>> = OnceLock::new();
 
     let metric = METRIC.get_or_init(|| {
@@ -191,32 +188,18 @@ pub fn increment_move_made(mv: Move, model_color: Color) {
             KeyValue::new("move_type", mv_type),
             KeyValue::new("piece", piece),
             KeyValue::new("model_color", color),
+            KeyValue::new("model_name", model_name.to_string()),
+            KeyValue::new("opponent_name", opponent_name.to_string()),
         ],
     );
 }
 
-pub fn increment_model_won(model_color: Color) {
-    static METRIC: OnceLock<Counter<u64>> = OnceLock::new();
-
-    let metric = METRIC.get_or_init(|| {
-        let meter = opentelemetry::global::meter_with_scope(scope().clone());
-
-        meter
-            .u64_counter("model_won_total")
-            .with_description("a counter for games won by model.")
-            .with_unit("games")
-            .build()
-    });
-
-    let color = match model_color {
-        Color::Black => "black",
-        Color::White => "white",
-    };
-
-    metric.add(1, &[KeyValue::new("model_color", color)]);
-}
-
-pub fn record_game_turns(game_turns: usize, model_color: Color) {
+pub fn record_game_turns(
+    game_turns: usize,
+    model_color: Color,
+    model_name: &str,
+    opponent_name: &str,
+) {
     static METRIC: OnceLock<Histogram<u64>> = OnceLock::new();
 
     let metric = METRIC.get_or_init(|| {
@@ -230,15 +213,36 @@ pub fn record_game_turns(game_turns: usize, model_color: Color) {
             .build()
     });
 
-    let color = match model_color {
-        Color::Black => "black",
-        Color::White => "white",
+    let (color, opponent_color) = match model_color {
+        Color::Black => ("black", "white"),
+        Color::White => ("white", "black"),
     };
 
-    metric.record(game_turns as u64, &[KeyValue::new("model_color", color)]);
+    metric.record(
+        game_turns as u64,
+        &[
+            KeyValue::new("model_color", color),
+            KeyValue::new("model_name", model_name.to_string()),
+            KeyValue::new("opponent_name", opponent_name.to_string()),
+        ],
+    );
+
+    metric.record(
+        game_turns as u64,
+        &[
+            KeyValue::new("model_color", opponent_color),
+            KeyValue::new("model_name", opponent_name.to_string()),
+            KeyValue::new("opponent_name", model_name.to_string()),
+        ],
+    );
 }
 
-pub fn record_game_duration(game_duration: f64, model_color: Color) {
+pub fn record_game_duration(
+    game_duration: f64,
+    model_color: Color,
+    model_name: &str,
+    opponent_name: &str,
+) {
     static METRIC: OnceLock<Histogram<f64>> = OnceLock::new();
 
     let metric = METRIC.get_or_init(|| {
@@ -254,12 +258,28 @@ pub fn record_game_duration(game_duration: f64, model_color: Color) {
             .build()
     });
 
-    let color = match model_color {
-        Color::Black => "black",
-        Color::White => "white",
+    let (color, opponent_color) = match model_color {
+        Color::Black => ("black", "white"),
+        Color::White => ("white", "black"),
     };
 
-    metric.record(game_duration, &[KeyValue::new("model_color", color)]);
+    metric.record(
+        game_duration,
+        &[
+            KeyValue::new("model_color", color),
+            KeyValue::new("model_name", model_name.to_string()),
+            KeyValue::new("opponent_name", opponent_name.to_string()),
+        ],
+    );
+
+    metric.record(
+        game_duration,
+        &[
+            KeyValue::new("model_color", opponent_color),
+            KeyValue::new("model_name", opponent_name.to_string()),
+            KeyValue::new("opponent_name", model_name.to_string()),
+        ],
+    );
 }
 
 pub fn record_frame_buffer_count(frame_count: usize) {
@@ -369,7 +389,7 @@ pub fn record_training_batches(batch_count: usize) {
     metric.record(batch_count as u64, &[]);
 }
 
-pub fn record_win_rate_vs_initial(win_rate: f64) {
+pub fn record_win_rate_vs_initial(win_rate: f64, model_name: &str) {
     static METRIC: OnceLock<Gauge<f64>> = OnceLock::new();
 
     let metric = METRIC.get_or_init(|| {
@@ -381,10 +401,18 @@ pub fn record_win_rate_vs_initial(win_rate: f64) {
             .build()
     });
 
-    metric.record(win_rate, &[]);
+    metric.record(
+        win_rate,
+        &[KeyValue::new("model_name", model_name.to_string())],
+    );
 }
 
-pub fn record_minibatch_statistics(value_loss: f64, policy_loss: f64, entropy_loss: f64) {
+pub fn record_minibatch_statistics(
+    value_loss: f64,
+    policy_loss: f64,
+    entropy_loss: f64,
+    model_name: &str,
+) {
     static TRAINING_ITERATIONS_COUNT_TOTAL: OnceLock<Counter<u64>> = OnceLock::new();
     static TRAINING_VALUE_LOSS_TOTAL: OnceLock<Counter<f64>> = OnceLock::new();
     static TRAINING_POLICY_LOSS_TOTAL: OnceLock<Counter<f64>> = OnceLock::new();
@@ -426,8 +454,17 @@ pub fn record_minibatch_statistics(value_loss: f64, policy_loss: f64, entropy_lo
             .build()
     });
 
-    training_iterations_count_total.add(1, &[]);
-    training_value_loss_total.add(value_loss, &[]);
-    training_policy_loss_total.add(policy_loss, &[]);
-    training_entropy_loss_total.add(entropy_loss, &[]);
+    training_iterations_count_total.add(1, &[KeyValue::new("model_name", model_name.to_string())]);
+    training_value_loss_total.add(
+        value_loss,
+        &[KeyValue::new("model_name", model_name.to_string())],
+    );
+    training_policy_loss_total.add(
+        policy_loss,
+        &[KeyValue::new("model_name", model_name.to_string())],
+    );
+    training_entropy_loss_total.add(
+        entropy_loss,
+        &[KeyValue::new("model_name", model_name.to_string())],
+    );
 }

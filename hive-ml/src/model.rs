@@ -21,7 +21,7 @@ impl HiveModel {
         //};
 
         let input_encoded_dims = INPUT_ENCODED_DIMS as i64;
-        let channels = 32;
+        let channels = 64;
 
         let conv_i = tch::nn::conv2d(
             p / "l0" / "conv",
@@ -58,16 +58,18 @@ impl HiveModel {
             })
             .collect::<Vec<_>>();
 
+        let dims_after_conv = 2304;
         let value_layer = nn::seq()
-            .add(nn::linear(p / "c2", 1152, 1, Default::default()))
+            .add(nn::linear(p / "c" / "l1", dims_after_conv, 1, Default::default()))
             .add_fn(|xs| xs.tanh());
 
-        let policy_layer = nn::seq().add(nn::linear(
-            p / "a2",
-            1152,
-            OUTPUT_LENGTH as i64,
-            Default::default(),
-        ));
+        let policy_layer = nn::seq()
+            .add(nn::linear(
+                p / "a" / "l2",
+                dims_after_conv,
+                OUTPUT_LENGTH as i64,
+                Default::default(),
+            ));
 
         Self {
             policy_layer,

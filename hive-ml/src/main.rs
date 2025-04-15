@@ -16,7 +16,7 @@ use hive_ml::{
     hypers::{self},
     model::HiveModel,
 };
-use rand::prelude::Distribution;
+use rand::seq::SliceRandom;
 use tch::nn::{Optimizer, OptimizerConfig, VarStore};
 use tch::{nn, IndexOp, Kind, Tensor};
 
@@ -26,8 +26,42 @@ use tch::{nn, IndexOp, Kind, Tensor};
 struct ModelData {
     name: String,
     vs: VarStore,
-    frames: MultipleGames,
+    frames: Mutex<MultipleGames>,
     model: Mutex<HiveModel>,
+}
+
+struct PlayerGameData<'a> {
+    name: &'a str,
+    model: &'a HiveModel,
+    samples: &'a mut SingleGame,
+}
+
+impl ModelData {
+    fn new(
+        name: &str,
+        device: tch::Device,
+        load_from_epoch: Option<usize>,
+    ) -> Result<Self, Box<dyn Error>> {
+        let mut vs = nn::VarStore::new(device);
+        let model = Mutex::new(HiveModel::new(&vs.root()));
+
+        if let Some(epoch) = load_from_epoch {
+            vs.load(format!("models/{}_epoch_{}", name, epoch))?;
+        }
+
+        Ok(Self {
+            name: name.to_string(),
+            vs,
+            frames: Mutex::new(MultipleGames::default()),
+            model,
+        })
+    }
+
+    fn save_model(&self, epoch: usize) -> Result<(), Box<dyn Error>> {
+        self.vs
+            .save(format!("models/{}_epoch_{}", self.name, epoch))?;
+        Ok(())
+    }
 }
 
 pub fn main() -> Result<(), Box<dyn Error>> {
@@ -36,296 +70,167 @@ pub fn main() -> Result<(), Box<dyn Error>> {
     metrics::record_training_start_time();
     metrics::record_training_status(true);
 
-    let mut vs = nn::VarStore::new(device);
-    
-    let model = &Mutex::new(HiveModel::new(&vs.root()));
-    vs.load("models/epoch_180")?;
+    // Create four models to train in parallel
+    let mut models = Vec::new();
+    for i in 0..hypers::NUMBER_OF_MODELS {
+        models.push(ModelData::new(hypers::MODEL_NAMES[i], device, None)?);
+    }
 
-    // let opponent = &model;
-    let mut opponent_vs = nn::VarStore::new(device);
-    let _opponent = &Mutex::new(HiveModel::new(&opponent_vs.root()));
-    opponent_vs.copy(&vs)?;
+    let indices = (0..models.len()).collect::<Vec<_>>();
+    let play_as: &[Color] = &[Color::White, Color::Black];
+
+    // Save initial state of all models
+    for model in &models {
+        model.save_model(0)?;
+    }
 
     let mut lr = hypers::INITIAL_LEARNING_RATE;
-    let mut entropy_loss_factor = hypers::ENTROPY_LOSS_RATIO;
+    let entropy_loss_factor = hypers::ENTROPY_LOSS_RATIO;
     let max_frames_per_game = hypers::MAX_FRAMES_PER_GAME;
-
-    vs.save("models/epoch_0")?;
-
-    let frames = Mutex::new(MultipleGames::default());
     let quantiles = Tensor::from_slice(&[0.5f32, 0.8f32, 0.99f32]);
 
-    // When the win rate gets above 75%, we switch sides and pin the opponent to
-    // the current version to learn to beat our previous strategy.
-    // let mut model_plays_as = Color::White;
-    let mut rolling_win_rate = 0.50;
-
     println!("Starting train loop");
+    let mut main_rng = rand::thread_rng();
     for epoch in 1..251 {
         metrics::record_epoch(epoch);
+        models.shuffle(&mut main_rng);
 
-        let st = Instant::now();
-        let games_played = &AtomicUsize::new(0);
-        let games_won = &AtomicUsize::new(0);
-        let games_won_by_model = &AtomicUsize::new(0);
-        let games_played_white_model = &AtomicUsize::new(0);
-        let games_won_white_model = &AtomicUsize::new(0);
-        let games_played_black_model = &AtomicUsize::new(0);
-        let games_won_black_model = &AtomicUsize::new(0);
-        let games_lengths: &Mutex<Vec<f32>> = &Mutex::new(Vec::new());
-        let games_finished = &AtomicUsize::new(0);
-        let distribution = rand::distributions::Bernoulli::new(1.0 - rolling_win_rate).unwrap();
-
-        std::thread::scope(|scope| {
-            let handles = (0..hypers::PARALLEL_GAMES)
-                .map(|_| {
-                    scope.spawn(|| {
-                        let mut local_vs = nn::VarStore::new(device);
-                        let local_model = Mutex::new(HiveModel::new(&local_vs.root()));
-                        local_vs.copy(&vs).unwrap();
-
-                        let mut local_opponent_vs = nn::VarStore::new(device);
-                        let local_opponent = Mutex::new(HiveModel::new(&local_opponent_vs.root()));
-                        local_opponent_vs.copy(&opponent_vs).unwrap();
-
-                        let mut rng = rand::thread_rng();
-                        let samples = &mut SingleGame::default();
-                        assert!(samples.validate_buffers());
-                        samples.clear();
-
-                        while frames.lock().unwrap().len() < hypers::TARGET_FRAMES_PER_BATCH {
-                            let model_plays_as;
-                            let white_model;
-                            let black_model;
-                            if distribution.sample(&mut rng) {
-                                model_plays_as = Color::White;
-                                white_model = &local_model;
-                                black_model = &local_opponent;
-                                games_played_white_model.fetch_add(1, Ordering::Relaxed);
-                            } else {
-                                model_plays_as = Color::Black;
-                                white_model = &local_opponent;
-                                black_model = &local_model;
-                                games_played_black_model.fetch_add(1, Ordering::Relaxed);
-                            };
-
-                            let mut game = Game::new();
-                            let game_start_time = Instant::now();
-                            games_played.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            metrics::increment_games_played(model_plays_as);
-
-                            let winner = match play_game_to_end(
-                                &mut game,
-                                model_plays_as,
-                                white_model,
-                                black_model,
-                                samples,
-                            ) {
-                                Ok(winner) => winner,
-                                Err(HiveError::TurnLimitHit) => {
-                                    samples.clear();
-                                    metrics::increment_games_finished(model_plays_as, None, true);
-                                    continue;
-                                }
-                                Err(e) => return Err(e),
-                            };
-
-                            let elapsed = Instant::now() - game_start_time;
-                            metrics::record_game_duration(elapsed.as_secs_f64(), model_plays_as);
-
-                            if winner == Some(Color::White) {
-                                games_won.fetch_add(1, Ordering::Relaxed);
-                            }
-
-                            if winner == Some(model_plays_as) {
-                                games_won_by_model.fetch_add(1, Ordering::Relaxed);
-                                metrics::increment_model_won(model_plays_as);
-
-                                if model_plays_as == Color::White {
-                                    games_won_white_model.fetch_add(1, Ordering::Relaxed);
-                                } else {
-                                    games_won_black_model.fetch_add(1, Ordering::Relaxed);
-                                }
-                            }
-
-                            metrics::increment_games_finished(model_plays_as, winner, false);
-                            games_finished.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-                            metrics::record_game_turns(game.turn(), model_plays_as);
-                            games_lengths.lock().unwrap().push(game.turn() as f32);
-
-                            let mut frames = frames.lock().unwrap();
-                            frames.ingest_game(
-                                samples,
-                                winner,
-                                hypers::GAMMA,
-                                hypers::LAMBDA,
-                                max_frames_per_game,
-                            );
-
-                            metrics::record_frame_buffer_count(frames.len());
-                        }
-
-                        Result::<_, HiveError>::Ok(())
-                    })
-                })
-                .collect::<Vec<_>>();
-
-            for handle in handles {
-                match handle.join() {
-                    Ok(result) => result?,
-                    Err(err) => std::panic::resume_unwind(err),
-                }
-            }
-
-            Result::<(), HiveError>::Ok(())
-        })?;
-
-        let mut frames = frames.lock().unwrap();
-        let lengths = Tensor::from_slice(games_lengths.lock().unwrap().as_slice());
-        let percentiles: Vec<f32> = lengths
-            .quantile(&quantiles, None, false, "linear")
-            .try_into()?;
-
-        let win_rate = games_won.load(std::sync::atomic::Ordering::Relaxed) as f64
-            / games_finished.load(std::sync::atomic::Ordering::Relaxed) as f64;
-
-        let model_win_rate = games_won_by_model.load(std::sync::atomic::Ordering::Relaxed) as f64
-            / games_finished.load(std::sync::atomic::Ordering::Relaxed) as f64;
-
-        // if model_plays_as == Color::Black {
-        //     win_rate = 100.0 - win_rate;
-        // }
-
-        println!(
-            "Epoch: {}, Played: {}, Finished: {}, WR: {:.2}, MWR: {:.2}, Time: {:.2}s, Frames: {}, P50 Turns: {:.0}, P80 Turns: {:.0}, P99 Turns: {:.0}",
-            epoch,
-            games_played.load(std::sync::atomic::Ordering::Relaxed),
-            games_finished.load(std::sync::atomic::Ordering::Relaxed),
-            100.0 * win_rate,
-            100.0 * model_win_rate,
-            (Instant::now() - st).as_secs_f32(),
-            frames.len(),
-            percentiles[0],
-            percentiles[1],
-            percentiles[2],
-        );
-
-        metrics::record_data_generation_duration((Instant::now() - st).as_secs_f64());
-
-        let white_win_rate = games_won_white_model.load(Ordering::Relaxed) as f64
-            / games_played_white_model.load(Ordering::Relaxed) as f64;
-
-        let black_win_rate = games_won_black_model.load(Ordering::Relaxed) as f64
-            / games_played_black_model.load(Ordering::Relaxed) as f64;
-
-        // The model can learn a strategy that works better from one side or the other.
-        // Since white goes first, it's typically from the white side so we use the ratio between the win
-        // rate of white and black to decide which color we should play more of.
-        let modified_win_rate = white_win_rate / (white_win_rate + black_win_rate);
-
-        rolling_win_rate = hypers::WIN_RATE_SMOOTHING_FACTOR * rolling_win_rate
-            + (1.0 - hypers::WIN_RATE_SMOOTHING_FACTOR) * modified_win_rate;
-
-        if (rolling_win_rate - 0.5).abs() > 0.05 {
-            entropy_loss_factor *= 1.10;
-            entropy_loss_factor = entropy_loss_factor.min(hypers::MAX_ENTROPY_LOSS_RATIO);
-        } else {
-            entropy_loss_factor *= 0.975;
-            entropy_loss_factor = entropy_loss_factor.max(hypers::MIN_ENTROPY_LOSS_RATIO);
-        }
-
-        // Do a training loop.
-        let st = Instant::now();
-
-        // Create a new optimizer each epoch to avoid momentum carrying over inappropriate
-        // from batch to batch.
-        let mut adam = nn::Adam::default().build(&vs, lr).unwrap();
-        metrics::record_learning_rate(lr);
-        metrics::record_entropy_loss_scale(entropy_loss_factor);
-
-        _train_loop(
-            &mut adam,
-            &mut *model.lock().unwrap(),
-            &*frames,
-            entropy_loss_factor,
-        );
-
-        metrics::record_training_duration((Instant::now() - st).as_secs_f64());
-        println!(
-            "Epoch: {}, Training Iteration Complete, Time Taken: {}s",
-            epoch,
-            (Instant::now() - st).as_secs_f32()
-        );
-
-        frames.clear();
-        metrics::record_frame_buffer_count(frames.len());
-
-        vs.save(format!("models/epoch_{0}", epoch))?;
-
-        if let Ok(env_var) = std::env::var("HIVE_OVERRIDE_LEARNING_RATE") {
-            println!("Learning Rate Override Variable Set");
-            if let Ok(value) = env_var.parse() {
-                println!("Learning Rate Override detected. New value: {}", value);
-                lr = value;
-            } else {
-                println!("Unable to parse learning rate. Env var {}", env_var);
-            }
-        }
-
-        println!("Updating opponent to current model");
-        opponent_vs.copy(&vs)?;
-        metrics::increment_leveled_up_opponent();
-
-        if epoch % 10 == 0 {
-            lr = hypers::MIN_LEARNING_RATE.max(lr * hypers::LEARNING_RATE_DECAY);
-
-            println!("Testing against initial model...");
-            let mut old_vs = VarStore::new(device);
-            let old_model = Mutex::new(HiveModel::new(&old_vs.root()));
-            old_vs.load("models/epoch_0")?;
+        // Train each model in sequence
+        for model_data in models.iter() {
+            println!("Training model {}", model_data.name);
 
             let st = Instant::now();
             let games_played = &AtomicUsize::new(0);
-            let white_won = &AtomicUsize::new(0);
-            let black_won = &AtomicUsize::new(0);
-            let drawn = &AtomicUsize::new(0);
+            let games_lengths: &Mutex<Vec<f32>> = &Mutex::new(Vec::new());
+            let games_finished = &AtomicUsize::new(0);
 
             std::thread::scope(|scope| {
                 let handles = (0..hypers::PARALLEL_GAMES)
                     .map(|_| {
                         scope.spawn(|| {
-                            let mut last_iter_failed = false;
-                            while last_iter_failed
-                                || games_played.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                                    < hypers::GAMES_PER_AI_SIMULATION
+                            let mut thread_vs = nn::VarStore::new(device);
+                            let thread_model = &HiveModel::new(&thread_vs.root());
+                            thread_vs.copy(&model_data.vs).unwrap();
+
+                            let mut opponents = Vec::new();
+                            for model_data in models.iter() {
+                                let mut opponent_vs = nn::VarStore::new(device);
+                                let opponent = HiveModel::new(&opponent_vs.root());
+                                opponent_vs.copy(&model_data.vs).unwrap();
+                                opponents.push(opponent);
+                            }
+
+                            let mut rng = rand::thread_rng();
+                            let samples = &mut SingleGame::default();
+                            let opponent_samples = &mut SingleGame::default();
+
+                            while model_data.frames.lock().unwrap().len()
+                                < hypers::TARGET_FRAMES_PER_BATCH
                             {
-                                last_iter_failed = false;
+                                samples.clear();
+                                opponent_samples.clear();
+
+                                // The rest of the game playing code remains the same
+                                let model_plays_as = *play_as.choose(&mut rng).unwrap();
+                                let mut white_model;
+                                let mut black_model;
+
+                                let opponent_idx = *indices.choose(&mut rng).unwrap();
+                                let opponent = &opponents[opponent_idx];
+                                let opponent_name = &*models[opponent_idx].name;
+
+                                if model_plays_as == Color::White {
+                                    white_model = PlayerGameData {
+                                        name: model_data.name.as_str(),
+                                        samples: samples,
+                                        model: thread_model,
+                                    };
+
+                                    black_model = PlayerGameData {
+                                        name: opponent_name,
+                                        samples: opponent_samples,
+                                        model: opponent,
+                                    };
+                                } else {
+                                    black_model = PlayerGameData {
+                                        name: model_data.name.as_str(),
+                                        samples: samples,
+                                        model: thread_model,
+                                    };
+
+                                    white_model = PlayerGameData {
+                                        name: opponent_name,
+                                        samples: opponent_samples,
+                                        model: opponent,
+                                    };
+                                };
+
                                 let mut game = Game::new();
-                                let samples = &mut Default::default();
-                                match play_game_to_end(
+                                let game_start_time = Instant::now();
+                                games_played.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+                                let mut stalled = false;
+                                let winner = match play_game_to_end(
                                     &mut game,
-                                    Color::White,
-                                    &model,
-                                    &old_model,
-                                    samples,
+                                    &mut white_model,
+                                    &mut black_model,
                                 ) {
-                                    Ok(None) => {
-                                        drawn.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    }
-                                    Ok(Some(Color::White)) => {
-                                        white_won
-                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    }
-                                    Ok(Some(Color::Black)) => {
-                                        black_won
-                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    }
+                                    Ok(winner) => winner,
                                     Err(HiveError::TurnLimitHit) => {
-                                        last_iter_failed = true;
-                                        continue;
+                                        stalled = true;
+                                        None
                                     }
                                     Err(e) => return Err(e),
+                                };
+
+                                let elapsed = Instant::now() - game_start_time;
+                                metrics::record_game_duration(
+                                    elapsed.as_secs_f64(),
+                                    model_plays_as,
+                                    &model_data.name,
+                                    opponent_name,
+                                );
+
+                                metrics::increment_games_finished(
+                                    model_plays_as,
+                                    winner,
+                                    stalled,
+                                    &model_data.name,
+                                    opponent_name,
+                                );
+
+                                games_finished.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+                                metrics::record_game_turns(
+                                    game.turn(),
+                                    model_plays_as,
+                                    &model_data.name,
+                                    opponent_name,
+                                );
+
+                                games_lengths.lock().unwrap().push(game.turn() as f32);
+
+                                let mut frames = model_data.frames.lock().unwrap();
+                                frames.ingest_game(
+                                    samples,
+                                    winner,
+                                    hypers::GAMMA,
+                                    hypers::LAMBDA,
+                                    max_frames_per_game,
+                                );
+
+                                metrics::record_frame_buffer_count(frames.len());
+                                drop(frames);
+
+                                let mut frames = models[opponent_idx].frames.lock().unwrap();
+                                if frames.len() < hypers::TARGET_FRAMES_PER_BATCH {
+                                    frames.ingest_game(
+                                        opponent_samples,
+                                        winner,
+                                        hypers::GAMMA,
+                                        hypers::LAMBDA,
+                                        max_frames_per_game,
+                                    );
                                 }
                             }
 
@@ -344,20 +249,146 @@ pub fn main() -> Result<(), Box<dyn Error>> {
                 Result::<(), HiveError>::Ok(())
             })?;
 
-            let white_won = white_won.load(Ordering::Relaxed);
-            let black_won = black_won.load(Ordering::Relaxed);
-
-            metrics::record_win_rate_vs_initial(
-                100.0 * white_won as f64 / (white_won + black_won) as f64,
-            );
+            let frames = model_data.frames.lock().unwrap();
+            let lengths = Tensor::from_slice(games_lengths.lock().unwrap().as_slice());
+            let percentiles: Vec<f32> = lengths
+                .quantile(&quantiles, None, false, "linear")
+                .try_into()?;
 
             println!(
-                "Vs Random, Wins (new): {}, Wins (random): {}, Ties: {}, Time: {:.2}s",
-                white_won,
-                black_won,
-                drawn.load(std::sync::atomic::Ordering::Relaxed),
+                "Epoch: {}, Model: {}, Played: {}, Finished: {}, Time: {:.2}s, Frames: {}, P50 Turns: {:.0}, P80 Turns: {:.0}, P99 Turns: {:.0}",
+                epoch,
+                model_data.name,
+                games_played.load(std::sync::atomic::Ordering::Relaxed),
+                games_finished.load(std::sync::atomic::Ordering::Relaxed),
                 (Instant::now() - st).as_secs_f32(),
+                frames.len(),
+                percentiles[0],
+                percentiles[1],
+                percentiles[2],
             );
+
+            metrics::record_data_generation_duration((Instant::now() - st).as_secs_f64());
+        }
+
+        let st = Instant::now();
+
+        for model_data in models.iter_mut() {
+            let mut adam = nn::Adam::default().build(&model_data.vs, lr).unwrap();
+            let frames = &mut *model_data.frames.lock().unwrap();
+            metrics::record_learning_rate(lr);
+
+            _train_loop(
+                &mut adam,
+                &mut *model_data.model.lock().unwrap(),
+                frames,
+                entropy_loss_factor,
+                &model_data.name,
+            );
+
+            frames.clear();
+            model_data.save_model(epoch)?;
+            metrics::record_training_duration((Instant::now() - st).as_secs_f64());
+            metrics::record_frame_buffer_count(frames.len());
+        }
+
+        lr = hypers::MIN_LEARNING_RATE.max(lr * hypers::LEARNING_RATE_DECAY);
+        if epoch % 10 == 0 {
+            for model_data in models.iter() {
+                println!("Testing {} against initial model...", model_data.name);
+
+                let st = Instant::now();
+                let games_played = &AtomicUsize::new(0);
+                let white_won = &AtomicUsize::new(0);
+                let black_won = &AtomicUsize::new(0);
+                let drawn = &AtomicUsize::new(0);
+
+                std::thread::scope(|scope| {
+                    let handles = (0..hypers::PARALLEL_GAMES)
+                        .map(|_| {
+                            scope.spawn(|| {
+                                let mut thread_vs = nn::VarStore::new(device);
+                                let thread_model = &HiveModel::new(&thread_vs.root());
+                                thread_vs.copy(&model_data.vs).unwrap();
+
+                                let mut old_vs = VarStore::new(device);
+                                let old_model = HiveModel::new(&old_vs.root());
+                                old_vs.load("models/model_a_epoch_0").unwrap();
+
+                                let mut last_iter_failed = false;
+                                while last_iter_failed
+                                    || games_played
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                                        < hypers::GAMES_PER_AI_SIMULATION
+                                {
+                                    let mut player = PlayerGameData {
+                                        model: &thread_model,
+                                        name: &model_data.name,
+                                        samples: &mut Default::default(),
+                                    };
+
+                                    let mut old_player = PlayerGameData {
+                                        model: &old_model,
+                                        name: "model_old",
+                                        samples: &mut Default::default(),
+                                    };
+
+                                    last_iter_failed = false;
+                                    let mut game = Game::new();
+                                    match play_game_to_end(&mut game, &mut player, &mut old_player)
+                                    {
+                                        Ok(None) => {
+                                            drawn
+                                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        }
+                                        Ok(Some(Color::White)) => {
+                                            white_won
+                                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        }
+                                        Ok(Some(Color::Black)) => {
+                                            black_won
+                                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        }
+                                        Err(HiveError::TurnLimitHit) => {
+                                            last_iter_failed = true;
+                                            continue;
+                                        }
+                                        Err(e) => return Err(e),
+                                    }
+                                }
+
+                                Result::<_, HiveError>::Ok(())
+                            })
+                        })
+                        .collect::<Vec<_>>();
+
+                    for handle in handles {
+                        match handle.join() {
+                            Ok(result) => result?,
+                            Err(err) => std::panic::resume_unwind(err),
+                        }
+                    }
+
+                    Result::<(), HiveError>::Ok(())
+                })?;
+
+                let white_won = white_won.load(Ordering::Relaxed);
+                let black_won = black_won.load(Ordering::Relaxed);
+
+                metrics::record_win_rate_vs_initial(
+                    100.0 * white_won as f64 / (white_won + black_won) as f64,
+                    &model_data.name,
+                );
+
+                println!(
+                    "Model: {}, Vs Initial, Wins (new): {}, Wins (initial): {}, Ties: {}, Time: {:.2}s",
+                    model_data.name,
+                    white_won,
+                    black_won,
+                    drawn.load(std::sync::atomic::Ordering::Relaxed),
+                    (Instant::now() - st).as_secs_f32(),
+                );
+            }
         }
     }
 
@@ -366,12 +397,10 @@ pub fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn play_game_to_end(
+fn play_game_to_end<'a>(
     g: &mut Game,
-    training_model_color: Color,
-    white_model: &Mutex<HiveModel>,
-    black_model: &Mutex<HiveModel>,
-    samples: &mut SingleGame,
+    white_player: &'a mut PlayerGameData<'a>,
+    black_player: &'a mut PlayerGameData<'a>,
 ) -> hive_engine::Result<Option<Color>> {
     let mut consecutive_passes = 0;
     let mut valid_moves = Vec::new();
@@ -390,21 +419,17 @@ fn play_game_to_end(
     })?;
 
     loop {
-        let model = if g.to_play() == Color::White {
-            white_model
+        let (player, opponent) = if g.to_play() == Color::White {
+            (&mut *white_player, &mut *black_player)
         } else {
-            black_model
+            (&mut *black_player, &mut *white_player)
         };
 
         if g.turn() == hypers::MAX_TURNS_PER_GAME {
             return Err(HiveError::TurnLimitHit);
         }
 
-        if samples.game_state.len() > 2 * hypers::MAX_TURNS_PER_GAME {
-            panic!("{}", g.turn());
-        }
-
-        let device = model.lock().unwrap().device;
+        let device = player.model.device;
 
         if let Some(result) = g.is_game_is_over() {
             if let GameWinner::Winner(color) = result {
@@ -422,9 +447,7 @@ fn play_game_to_end(
         g.load_all_potential_moves(&mut valid_moves)?;
 
         if valid_moves.is_empty() {
-            if playing == training_model_color {
-                metrics::increment_move_made(Move::Pass, training_model_color);
-            }
+            metrics::increment_move_made(Move::Pass, playing, player.name, opponent.name);
 
             g.make_move(Move::Pass)?;
             consecutive_passes += 1;
@@ -443,8 +466,7 @@ fn play_game_to_end(
         let map = translate_to_valid_moves_mask(&g, &valid_moves, playing, &mut invalid_moves_mask);
         let invalid_moves_tensor = Tensor::from_slice(&invalid_moves_mask);
 
-        let (value, mut policy) =
-            tch::no_grad(|| model.lock().unwrap().value_policy(&curr_state_batch));
+        let (value, mut policy) = tch::no_grad(|| player.model.value_policy(&curr_state_batch));
 
         let _ = policy.masked_fill_(&invalid_moves_tensor.to(device), f64::NEG_INFINITY);
 
@@ -453,17 +475,19 @@ fn play_game_to_end(
         let mv = map.get(&(action_prob as usize)).expect("populated above.");
         g.make_move(*mv)?;
 
-        if playing == training_model_color {
-            samples.playing.push(playing);
-            samples.game_state.push(curr_state);
-            samples.invalid_move_mask.push(invalid_moves_tensor);
-            samples.value.push(value.view(1i64).to(tch::Device::Cpu));
-            samples
-                .selected_policy
-                .push(sampled_action_idx.view(1i64).to(tch::Device::Cpu));
+        player.samples.playing.push(playing);
+        player.samples.game_state.push(curr_state);
+        player.samples.invalid_move_mask.push(invalid_moves_tensor);
+        player
+            .samples
+            .value
+            .push(value.view(1i64).to(tch::Device::Cpu));
+        player
+            .samples
+            .selected_policy
+            .push(sampled_action_idx.view(1i64).to(tch::Device::Cpu));
 
-            metrics::increment_move_made(*mv, training_model_color);
-        }
+        metrics::increment_move_made(*mv, playing, player.name, opponent.name);
     }
 
     Ok(winner)
@@ -474,6 +498,7 @@ fn _train_loop(
     model: &mut HiveModel,
     frames: &MultipleGames,
     entropy_loss_scaling: f64,
+    model_name: &str,
 ) -> usize {
     let state_buffer = Tensor::stack(frames.game_state.as_slice(), 0).to(model.device);
     let mask_buffer = Tensor::stack(frames.invalid_move_mask.as_slice(), 0).to(model.device);
@@ -485,8 +510,6 @@ fn _train_loop(
         .masked_fill_(&mask_buffer, f64::NEG_INFINITY)
         .log_softmax(1, None)
         .gather(1, &selections_buffer, false);
-
-    let clip_ratio = 0.1f64;
 
     let mut batch_count = 0;
     let mut total_value_loss = Tensor::zeros(1, (Kind::Float, model.device));
@@ -510,6 +533,8 @@ fn _train_loop(
             let _ = policies.masked_fill_(&mask, f64::NEG_INFINITY);
 
             let adv = gae_buffer.index_select(0, &idxs);
+            // Many of the papers normalize the advantages.
+            let adv = (&adv - adv.mean(None)) / (adv.std(false) + 1e-8);
 
             let logp = policies.log_softmax(1, None).gather(
                 1,
@@ -520,7 +545,7 @@ fn _train_loop(
             let logp_old = logp_old.index_select(0, &idxs);
 
             let ratio = (&logp - &logp_old).exp_();
-            let clip_adv = ratio.clamp(1.0 - clip_ratio, 1.0 + clip_ratio) * &adv;
+            let clip_adv = ratio.clamp(1.0 - hypers::EPSILON, 1.0 + hypers::EPSILON) * &adv;
 
             let pi_loss = (ratio * adv).minimum(&clip_adv).mean(None);
 
@@ -541,6 +566,7 @@ fn _train_loop(
                 f64::try_from(&value_loss).unwrap(),
                 f64::try_from(&pi_loss).unwrap(),
                 f64::try_from(&entropy_loss).unwrap(),
+                model_name,
             );
 
             let loss: Tensor = value_loss
@@ -555,6 +581,7 @@ fn _train_loop(
             }
 
             loss.backward();
+            adam.clip_grad_norm(0.5);
             adam.step();
         }
 

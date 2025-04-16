@@ -102,7 +102,7 @@ impl HiveModel {
         output = output.max_pool2d_default(2);
 
         for (c, bn) in &self.residual_blocks {
-            output = &output + output.apply(c).relu();
+            output = &output + output.apply(c).tanh();
             output = output.apply_t(bn, self.train_mode);
         }
 

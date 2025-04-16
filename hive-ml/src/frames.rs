@@ -141,15 +141,25 @@ impl MultipleGames {
         }
 
         self.game_state
-            .extend(other.game_state.drain(..).skip(samples_to_skip));
-        self.selected_policy
-            .extend(other.selected_policy.drain(..).skip(samples_to_skip));
-        self.invalid_move_mask
-            .extend(other.invalid_move_mask.drain(..).skip(samples_to_skip));
+            .extend(other.game_state.drain(..).skip(samples_to_skip).step_by(2));
+        self.selected_policy.extend(
+            other
+                .selected_policy
+                .drain(..)
+                .skip(samples_to_skip)
+                .step_by(2),
+        );
+        self.invalid_move_mask.extend(
+            other
+                .invalid_move_mask
+                .drain(..)
+                .skip(samples_to_skip)
+                .step_by(2),
+        );
         self.target_value
-            .extend(value.into_iter().skip(samples_to_skip));
+            .extend(value.into_iter().skip(samples_to_skip).step_by(2));
         self.gae
-            .extend(gae_values.into_iter().skip(samples_to_skip));
+            .extend(gae_values.into_iter().skip(samples_to_skip).step_by(2));
 
         other.playing.clear();
 

@@ -56,8 +56,8 @@ pub const MIN_LEARNING_RATE: f64 = 1e-7;
 pub const LEARNING_RATE_DECAY: f64 = 0.98;
 
 // pub const PENALIZE_TURNS_DISTANCE_FROM_END: isize = 60;
-pub const APPROXIMATE_TURN_MEMORY: usize = 50;
+pub const APPROXIMATE_TURN_MEMORY: usize = 100;
 pub const GAMMA: f64 = 1.0 - (1.0 / APPROXIMATE_TURN_MEMORY as f64);
-pub const LAMBDA: f64 = 0.96;
+pub const LAMBDA: f64 = 0.75;
 
 pub const MAX_SEQ_LENGTH: i64 = 2 * 11;

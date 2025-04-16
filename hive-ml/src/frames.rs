@@ -62,11 +62,13 @@ impl MultipleGames {
         &mut self,
         other: &mut SingleGame,
         winner: Option<Color>,
+        stalled: bool,
         mut gamma: f64,
         lambda: f64,
         max_frames_per_game: usize,
     ) {
         assert!(other.validate_buffers());
+        let playing = other.playing.unwrap();
 
         // If we have a short game, we should re-scale the rewards so that the
         // value at turn 0 is about 0.
@@ -77,20 +79,13 @@ impl MultipleGames {
         let gl = gamma * lambda;
         let mut value = std::mem::take(&mut other.value);
 
-        // Flip the signs on the value estimator so that everything is from white's perspective.
-        for idx in 0..value.len() {
-            if other.playing[idx] == Color::Black {
-                let _ = value[idx].neg_();
-            }
-        }
-
         let mut gae_values = Vec::with_capacity(value.len());
-        // let mut distance_to_end = 0;
 
         let mut gae = match winner {
+            None if stalled => Tensor::from(hypers::PENALTY_FOR_TIMING_OUT),
             None => Tensor::from(0.0f32),
-            Some(Color::White) => Tensor::from(1.0f32),
-            Some(Color::Black) => Tensor::from(-1.0f32),
+            Some(winner_color) if winner_color == playing => Tensor::from(1.0f32),
+            Some(..) => Tensor::from(-1.0f32),
         };
 
         let mut discounted_rewards = gae.copy();
@@ -101,17 +96,6 @@ impl MultipleGames {
                 gae_values.push(gae.copy());
                 continue;
             }
-
-            // let mut long_game_penalty: Tensor = {
-            //     let x = distance_to_end - hypers::PENALIZE_TURNS_DISTANCE_FROM_END;
-            //     let x = x as f64;
-            //     0.333 * Tensor::from(x / 2.0).sigmoid()
-            // };
-
-            // if idx < hypers::PENALIZE_TURNS_DISTANCE_FROM_END as usize {
-            //     let scale = idx as f64  / hypers::PENALIZE_TURNS_DISTANCE_FROM_END as f64;
-            //     long_game_penalty *= scale * scale;
-            // };
 
             let delta = gamma * &value[idx + 1] - &value[idx];
             value[idx + 1] = discounted_rewards.copy();
@@ -128,12 +112,6 @@ impl MultipleGames {
         value[0] = discounted_rewards;
 
         gae_values.reverse();
-        for idx in 0..gae_values.len() {
-            if other.playing[idx] == Color::Black {
-                let _ = gae_values[idx].neg_();
-                let _ = value[idx].neg_();
-            }
-        }
 
         let mut samples_to_skip = 0;
         if value.len() > 2 * max_frames_per_game {
@@ -161,7 +139,7 @@ impl MultipleGames {
         self.gae
             .extend(gae_values.into_iter().skip(samples_to_skip).step_by(2));
 
-        other.playing.clear();
+        other.playing.take();
 
         assert!(self.validate_buffers());
     }
@@ -169,7 +147,7 @@ impl MultipleGames {
 
 #[derive(Debug, Default)]
 pub struct SingleGame {
-    pub playing: Vec<Color>,
+    pub playing: Option<Color>,
     pub game_state: Vec<Tensor>,
 
     /// A 1x1 tensor that contains the index sampled by the policy.
@@ -183,7 +161,7 @@ pub struct SingleGame {
 
 impl SingleGame {
     pub fn clear(&mut self) {
-        self.playing.clear();
+        self.playing.take();
         self.game_state.clear();
         self.selected_policy.clear();
         self.invalid_move_mask.clear();
@@ -191,13 +169,12 @@ impl SingleGame {
     }
 
     pub fn len(&self) -> usize {
-        self.playing.len()
+        self.game_state.len()
     }
 
     pub fn validate_buffers(&self) -> bool {
-        let len = self.playing.len();
-        len == self.game_state.len()
-            && len == self.selected_policy.len()
+        let len = self.game_state.len();
+        len == self.selected_policy.len()
             && len == self.invalid_move_mask.len()
             && len == self.value.len()
     }

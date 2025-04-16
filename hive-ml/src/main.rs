@@ -139,6 +139,8 @@ pub fn main() -> Result<(), Box<dyn Error>> {
                                 let opponent = &opponents[opponent_idx];
                                 let opponent_name = &*models[opponent_idx].name;
 
+                                samples.playing = Some(model_plays_as);
+                                opponent_samples.playing = Some(model_plays_as.opposing());
                                 if model_plays_as == Color::White {
                                     white_model = PlayerGameData {
                                         name: model_data.name.as_str(),
@@ -214,6 +216,7 @@ pub fn main() -> Result<(), Box<dyn Error>> {
                                 frames.ingest_game(
                                     samples,
                                     winner,
+                                    stalled,
                                     hypers::GAMMA,
                                     hypers::LAMBDA,
                                     max_frames_per_game,
@@ -227,6 +230,7 @@ pub fn main() -> Result<(), Box<dyn Error>> {
                                     frames.ingest_game(
                                         opponent_samples,
                                         winner,
+                                        stalled,
                                         hypers::GAMMA,
                                         hypers::LAMBDA,
                                         max_frames_per_game,
@@ -292,7 +296,9 @@ pub fn main() -> Result<(), Box<dyn Error>> {
             metrics::record_frame_buffer_count(frames.len());
         }
 
-        lr = hypers::MIN_LEARNING_RATE.max(lr * hypers::LEARNING_RATE_DECAY);
+        // lr = hypers::MIN_LEARNING_RATE.max(lr * hypers::LEARNING_RATE_DECAY);
+        lr -= hypers::LEARNING_RATE_DECREASE;
+
         if epoch % 10 == 0 {
             for model_data in models.iter() {
                 println!("Testing {} against initial model...", model_data.name);
@@ -475,7 +481,6 @@ fn play_game_to_end<'a>(
         let mv = map.get(&(action_prob as usize)).expect("populated above.");
         g.make_move(*mv)?;
 
-        player.samples.playing.push(playing);
         player.samples.game_state.push(curr_state);
         player.samples.invalid_move_mask.push(invalid_moves_tensor);
         player
@@ -533,8 +538,11 @@ fn _train_loop(
             let _ = policies.masked_fill_(&mask, f64::NEG_INFINITY);
 
             let adv = gae_buffer.index_select(0, &idxs);
+
             // Many of the papers normalize the advantages.
-            let adv = (&adv - adv.mean(None)) / (adv.std(false) + 1e-8);
+            // In some small scale tests, I'm not seeing a significant advantage in our model.
+            // my guess is that it's because the rewards are bounded
+            // let adv = (&adv - adv.mean(None)) / (adv.std(false) + 1e-8);
 
             let logp = policies.log_softmax(1, None).gather(
                 1,
@@ -573,12 +581,12 @@ fn _train_loop(
                 - (hypers::PI_LOSS_RATIO * pi_loss)
                 - (entropy_loss_scaling * entropy_loss);
 
-            let approx_kl: f32 = (logp_old - logp).mean(None).try_into().expect("success");
+            // let approx_kl: f32 = (logp_old - logp).mean(None).try_into().expect("success");
 
-            if batch_count > 1 && approx_kl > hypers::CUTOFF_KL {
-                should_stop_early = true;
-                break;
-            }
+            // if batch_count > 1 && approx_kl > hypers::CUTOFF_KL {
+            //     should_stop_early = true;
+            //     break;
+            // }
 
             loss.backward();
             adam.clip_grad_norm(0.5);

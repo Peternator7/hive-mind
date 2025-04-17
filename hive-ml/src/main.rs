@@ -9,7 +9,10 @@ use hive_engine::movement::Move;
 use hive_engine::piece::{Insect, Piece};
 use hive_engine::position::Position;
 use hive_engine::{game::Game, piece::Color};
-use hive_ml::encode::{translate_game_to_conv_tensor, translate_to_valid_moves_mask};
+use hive_ml::encode::{
+    translate_game_to_conv_tensor, translate_to_valid_absolute_moves_mask,
+    translate_to_valid_moves_mask,
+};
 use hive_ml::metrics;
 use hive_ml::{
     frames::{MultipleGames, SingleGame},
@@ -70,6 +73,8 @@ pub fn main() -> Result<(), Box<dyn Error>> {
     metrics::record_training_start_time();
     metrics::record_training_status(true);
 
+    let random_model = ModelData::new("random_model", device, None)?;
+
     // Create four models to train in parallel
     let mut models = Vec::new();
     for i in 0..hypers::NUMBER_OF_MODELS {
@@ -91,7 +96,7 @@ pub fn main() -> Result<(), Box<dyn Error>> {
 
     println!("Starting train loop");
     let mut main_rng = rand::thread_rng();
-    for epoch in 1..251 {
+    for epoch in 1..hypers::EPOCHS {
         metrics::record_epoch(epoch);
         models.shuffle(&mut main_rng);
 
@@ -319,7 +324,7 @@ pub fn main() -> Result<(), Box<dyn Error>> {
 
                                 let mut old_vs = VarStore::new(device);
                                 let old_model = HiveModel::new(&old_vs.root());
-                                old_vs.load("models/model_a_epoch_0").unwrap();
+                                old_vs.copy(&random_model.vs).unwrap();
 
                                 let mut last_iter_failed = false;
                                 while last_iter_failed
@@ -469,7 +474,13 @@ fn play_game_to_end<'a>(
         let curr_state = translate_game_to_conv_tensor(&g, playing);
         let curr_state_batch = curr_state.unsqueeze(0).to(device);
 
-        let map = translate_to_valid_moves_mask(&g, &valid_moves, playing, &mut invalid_moves_mask);
+        // let map = translate_to_valid_moves_mask(&g, &valid_moves, playing, &mut invalid_moves_mask);
+        let map = translate_to_valid_moves_mask(
+            &g,
+            &valid_moves,
+            playing,
+            &mut invalid_moves_mask,
+        );
         let invalid_moves_tensor = Tensor::from_slice(&invalid_moves_mask);
 
         let (value, mut policy) = tch::no_grad(|| player.model.value_policy(&curr_state_batch));
@@ -553,6 +564,8 @@ fn _train_loop(
             let logp_old = logp_old.index_select(0, &idxs);
 
             let ratio = (&logp - &logp_old).exp_();
+            let ratio_f = f64::try_from(ratio.mean(None)).unwrap();
+            let adv_f = f64::try_from(adv.mean(None)).unwrap();
             let clip_adv = ratio.clamp(1.0 - hypers::EPSILON, 1.0 + hypers::EPSILON) * &adv;
 
             let pi_loss = (ratio * adv).minimum(&clip_adv).mean(None);
@@ -567,13 +580,16 @@ fn _train_loop(
             let p_prob = policies.softmax(1, None) + 0.00001;
             let h = mask.logical_not() * (&p_prob * p_prob.log());
             let entropy_loss = h.sum_dim_intlist(1, false, None).neg().mean(None);
-
+            let approx_kl: f64 = (logp_old - logp).mean(None).try_into().expect("success");
             // Tensor::stack(&[&value_loss, &pi_loss, &entropy_loss], 0).print();
 
             metrics::record_minibatch_statistics(
                 f64::try_from(&value_loss).unwrap(),
                 f64::try_from(&pi_loss).unwrap(),
                 f64::try_from(&entropy_loss).unwrap(),
+                ratio_f,
+                adv_f,
+                approx_kl,
                 model_name,
             );
 
@@ -581,12 +597,12 @@ fn _train_loop(
                 - (hypers::PI_LOSS_RATIO * pi_loss)
                 - (entropy_loss_scaling * entropy_loss);
 
-            // let approx_kl: f32 = (logp_old - logp).mean(None).try_into().expect("success");
-
-            // if batch_count > 1 && approx_kl > hypers::CUTOFF_KL {
-            //     should_stop_early = true;
-            //     break;
-            // }
+            if approx_kl > hypers::CUTOFF_KL {
+                should_stop_early = true;
+                if batch_count > 1 {
+                    break;
+                }
+            }
 
             loss.backward();
             adam.clip_grad_norm(0.5);

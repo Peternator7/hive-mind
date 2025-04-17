@@ -1,0 +1,15 @@
+notes:
+- skip by 2: 
+  - seems to cause long games
+- gamma: 
+  - seems to converge faster with a small-ish value 0.98
+- lambda:
+  - unclear, 0.90 seems about right though
+  - jk, higher bias seems to be performing better. (0.75)
+- cutoff epsilon:
+  - actually valuable, especially in the beginning to make sure we don't
+    just bounce around
+  - 0.2 seems to have been too big. 0.05 is doing better.
+- global gradient clipping:
+- advantage normalization:
+  - seems to learn faster without this.

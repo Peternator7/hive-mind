@@ -411,12 +411,18 @@ pub fn record_minibatch_statistics(
     value_loss: f64,
     policy_loss: f64,
     entropy_loss: f64,
+    pi_ratio: f64,
+    pi_adv: f64,
+    approximate_kl: f64,
     model_name: &str,
 ) {
     static TRAINING_ITERATIONS_COUNT_TOTAL: OnceLock<Counter<u64>> = OnceLock::new();
     static TRAINING_VALUE_LOSS_TOTAL: OnceLock<Counter<f64>> = OnceLock::new();
     static TRAINING_POLICY_LOSS_TOTAL: OnceLock<Counter<f64>> = OnceLock::new();
     static TRAINING_ENTROPY_LOSS_TOTAL: OnceLock<Counter<f64>> = OnceLock::new();
+    static TRAINING_PI_RATIO_TOTAL: OnceLock<Counter<f64>> = OnceLock::new();
+    static TRAINING_PI_ADV_TOTAL: OnceLock<Counter<f64>> = OnceLock::new();
+    static TRAINING_APPROXIMATE_KL_GAUGE: OnceLock<Gauge<f64>> = OnceLock::new();
 
     let training_iterations_count_total = TRAINING_ITERATIONS_COUNT_TOTAL.get_or_init(|| {
         let meter = opentelemetry::global::meter_with_scope(scope().clone());
@@ -454,6 +460,33 @@ pub fn record_minibatch_statistics(
             .build()
     });
 
+    let training_pi_ratio_total = TRAINING_PI_RATIO_TOTAL.get_or_init(|| {
+        let meter = opentelemetry::global::meter_with_scope(scope().clone());
+
+        meter
+            .f64_counter("training_pi_ratio_total")
+            .with_description("a counter for the total ratio between new and old policy.")
+            .build()
+    });
+
+    let training_pi_adv_total = TRAINING_PI_ADV_TOTAL.get_or_init(|| {
+        let meter = opentelemetry::global::meter_with_scope(scope().clone());
+
+        meter
+            .f64_counter("training_pi_adv_total")
+            .with_description("a counter for the total advantage.")
+            .build()
+    });
+
+    let training_approximate_kl_gauge = TRAINING_APPROXIMATE_KL_GAUGE.get_or_init(|| {
+        let meter = opentelemetry::global::meter_with_scope(scope().clone());
+
+        meter
+            .f64_gauge("training_approximate_kl")
+            .with_description("the approximate KL divergence during training")
+            .build()
+    });
+
     training_iterations_count_total.add(1, &[KeyValue::new("model_name", model_name.to_string())]);
     training_value_loss_total.add(
         value_loss,
@@ -465,6 +498,18 @@ pub fn record_minibatch_statistics(
     );
     training_entropy_loss_total.add(
         entropy_loss,
+        &[KeyValue::new("model_name", model_name.to_string())],
+    );
+    training_approximate_kl_gauge.record(
+        approximate_kl,
+        &[KeyValue::new("model_name", model_name.to_string())],
+    );
+    training_pi_ratio_total.add(
+        pi_ratio,
+        &[KeyValue::new("model_name", model_name.to_string())],
+    );
+    training_pi_adv_total.add(
+        pi_adv,
         &[KeyValue::new("model_name", model_name.to_string())],
     );
 }

@@ -407,7 +407,7 @@ pub fn record_win_rate_vs_initial(win_rate: f64, model_name: &str) {
     );
 }
 
-pub fn record_minibatch_statistics(
+pub fn record_policy_minibatch_statistics(
     value_loss: f64,
     policy_loss: f64,
     entropy_loss: f64,
@@ -510,6 +510,68 @@ pub fn record_minibatch_statistics(
     );
     training_pi_adv_total.add(
         pi_adv,
+        &[KeyValue::new("model_name", model_name.to_string())],
+    );
+}
+
+pub fn record_auxiliary_minibatch_statistics(
+    value_loss: f64,
+    soft_value_loss: f64,
+    kl_loss: f64,
+    model_name: &str,
+) {
+    static TRAINING_ITERATIONS_COUNT_TOTAL: OnceLock<Counter<u64>> = OnceLock::new();
+    static TRAINING_VALUE_LOSS_TOTAL: OnceLock<Counter<f64>> = OnceLock::new();
+    static TRAINING_SOFT_VALUE_LOSS_TOTAL: OnceLock<Counter<f64>> = OnceLock::new();
+    static TRAINING_KL_LOSS_TOTAL: OnceLock<Counter<f64>> = OnceLock::new();
+
+    let training_iterations_count_total = TRAINING_ITERATIONS_COUNT_TOTAL.get_or_init(|| {
+        let meter = opentelemetry::global::meter_with_scope(scope().clone());
+
+        meter
+            .u64_counter("training_auxiliary_iterations_count_total")
+            .with_description("a counter for the number of training iterations run.")
+            .build()
+    });
+
+    let training_value_loss_total = TRAINING_VALUE_LOSS_TOTAL.get_or_init(|| {
+        let meter = opentelemetry::global::meter_with_scope(scope().clone());
+
+        meter
+            .f64_counter("training_auxiliary_value_loss_total")
+            .with_description("a counter for the total value loss during training.")
+            .build()
+    });
+
+    let training_soft_value_loss_total = TRAINING_SOFT_VALUE_LOSS_TOTAL.get_or_init(|| {
+        let meter = opentelemetry::global::meter_with_scope(scope().clone());
+
+        meter
+            .f64_counter("training_auxiliary_soft_value_loss_total")
+            .with_description("a counter for the total policy loss during training.")
+            .build()
+    });
+
+    let training_kl_loss_total = TRAINING_KL_LOSS_TOTAL.get_or_init(|| {
+        let meter = opentelemetry::global::meter_with_scope(scope().clone());
+
+        meter
+            .f64_counter("training_auxiliary_kl_loss_total")
+            .with_description("a counter for the total entropy loss during training.")
+            .build()
+    });
+
+    training_iterations_count_total.add(1, &[KeyValue::new("model_name", model_name.to_string())]);
+    training_value_loss_total.add(
+        value_loss,
+        &[KeyValue::new("model_name", model_name.to_string())],
+    );
+    training_soft_value_loss_total.add(
+        soft_value_loss,
+        &[KeyValue::new("model_name", model_name.to_string())],
+    );
+    training_kl_loss_total.add(
+        kl_loss,
         &[KeyValue::new("model_name", model_name.to_string())],
     );
 }

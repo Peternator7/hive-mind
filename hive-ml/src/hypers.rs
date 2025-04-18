@@ -11,7 +11,7 @@ pub const EPSILON: f64 = 0.20;
 
 /// Number of games to run in parallel when training/testing.
 pub const PARALLEL_GAMES: usize = 8;
-pub const NUMBER_OF_MODELS: usize = 1;
+pub const NUMBER_OF_MODELS: usize = 4;
 pub const MODEL_NAMES: &'static [&'static str] = &[
     "model_a", "model_b", "model_c", "model_d", "model_e", "model_f", "model_g", "model_h",
 ];
@@ -32,7 +32,8 @@ pub const MAX_TURNS_PER_GAME: usize = 500;
 pub const MAX_FRAMES_PER_GAME: usize = 60;
 
 /// Max number of iters we'll do on a single batch of data.
-pub const TRAIN_ITERS_PER_BATCH: usize = 12;
+pub const TRAIN_ITERS_PER_BATCH: usize = 2;
+
 
 /// The minibatch size for training.
 pub const BATCH_SIZE: usize = 1024;
@@ -42,21 +43,25 @@ pub const EPOCHS: usize = 251;
 /// We want to learn the policy at a slower rate than the
 /// value because it's typically less stable.
 pub const PI_LOSS_RATIO: f64 = 1.0;
-pub const ENTROPY_LOSS_RATIO: f64 = 0.00;
+pub const ENTROPY_LOSS_RATIO: f64 = 0.001;
 
 // pub const EPOCHS_TO_USE_SPECIAL_LEARNING_RATE: usize = 3;
 // pub const LEARNING_RATE_ON_FIRST_N_EPOCHS: f64 = 1e-3;
 pub const INITIAL_LEARNING_RATE: f64 = 1e-4;
-pub const MIN_LEARNING_RATE: f64 = 1e-7;
 pub const LEARNING_RATE_DECREASE: f64 = INITIAL_LEARNING_RATE / EPOCHS as f64;
 
 // pub const PENALIZE_TURNS_DISTANCE_FROM_END: isize = 60;
 pub const PENALTY_FOR_TIMING_OUT: f64 = 0.500;
 pub const APPROXIMATE_TURN_MEMORY: usize = 100;
 pub const GAMMA: f64 = 1.0 - (1.0 / APPROXIMATE_TURN_MEMORY as f64);
-pub const LAMBDA: f64 = 0.75;
+pub const LAMBDA: f64 = 0.90;
 
 pub const MAX_SEQ_LENGTH: i64 = 2 * 11;
 
 pub const STEP_BY_INGESTING_GAME: usize = 2;
-pub const PERFORM_VALUE_TRAINING_EVERY_X_EPOCHS: usize = 6;
+
+pub const POLICY_PHASE_TRAIN_ITERS: usize = 2;
+pub const AUXILIARY_PHASE_TRAIN_ITERS: usize = 10;
+pub const AUXILIARY_PHASE_TRAIN_FREQUENCY: usize = 8;
+pub const AUXILIARY_VALUE_SCALE: f64 = 1.0;
+pub const AUXILIARY_BETA_CLONE: f64 = 0.10;

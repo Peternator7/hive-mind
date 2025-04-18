@@ -8,6 +8,7 @@ pub struct HiveModel {
     bn_i: tch::nn::BatchNorm,
     residual_blocks: Vec<(tch::nn::Conv2D, tch::nn::BatchNorm)>,
     policy_layer: tch::nn::Sequential,
+    soft_value_layer: tch::nn::Sequential,
     value_layer: tch::nn::Sequential,
 }
 
@@ -60,20 +61,34 @@ impl HiveModel {
 
         let dims_after_conv = 2304;
         let value_layer = nn::seq()
-            .add(nn::linear(p / "c" / "l1", dims_after_conv, 1, Default::default()))
+            .add(nn::linear(
+                p / "c" / "l1",
+                dims_after_conv,
+                1,
+                Default::default(),
+            ))
             .add_fn(|xs| xs.tanh());
 
-        let policy_layer = nn::seq()
+        let soft_value_layer = nn::seq()
             .add(nn::linear(
-                p / "a" / "l2",
+                p / "c_pi" / "l1",
                 dims_after_conv,
-                OUTPUT_LENGTH as i64,
+                1,
                 Default::default(),
-            ));
+            ))
+            .add_fn(|xs| xs.tanh());
+
+        let policy_layer = nn::seq().add(nn::linear(
+            p / "a" / "l2",
+            dims_after_conv,
+            OUTPUT_LENGTH as i64,
+            Default::default(),
+        ));
 
         Self {
             policy_layer,
             value_layer,
+            soft_value_layer,
             conv_i,
             bn_i,
             residual_blocks,
@@ -84,7 +99,19 @@ impl HiveModel {
 
     pub fn value_policy(&self, game_state: &Tensor) -> (Tensor, Tensor) {
         let t = self.shared_layers(game_state);
-        (t.apply(&self.value_layer), t.apply(&self.policy_layer))
+        (
+            t.detach().apply(&self.value_layer),
+            t.apply(&self.policy_layer),
+        )
+    }
+
+    pub fn value_soft_value_policy(&self, game_state: &Tensor) -> (Tensor, Tensor, Tensor) {
+        let t = self.shared_layers(game_state);
+        (
+            t.apply(&self.value_layer),
+            t.apply(&self.soft_value_layer),
+            t.apply(&self.policy_layer),
+        )
     }
 
     pub fn policy(&self, game_state: &Tensor) -> Tensor {

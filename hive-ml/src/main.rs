@@ -9,10 +9,7 @@ use hive_engine::movement::Move;
 use hive_engine::piece::{Insect, Piece};
 use hive_engine::position::Position;
 use hive_engine::{game::Game, piece::Color};
-use hive_ml::encode::{
-    translate_game_to_conv_tensor, translate_to_valid_absolute_moves_mask,
-    translate_to_valid_moves_mask,
-};
+use hive_ml::encode::{translate_game_to_conv_tensor, translate_to_valid_moves_mask};
 use hive_ml::metrics;
 use hive_ml::{
     frames::{MultipleGames, SingleGame},
@@ -30,6 +27,7 @@ struct ModelData {
     name: String,
     vs: VarStore,
     frames: Mutex<MultipleGames>,
+    auxiliary_frames: Mutex<MultipleGames>,
     model: Mutex<HiveModel>,
 }
 
@@ -55,7 +53,8 @@ impl ModelData {
         Ok(Self {
             name: name.to_string(),
             vs,
-            frames: Mutex::new(MultipleGames::default()),
+            frames: Default::default(),
+            auxiliary_frames: Default::default(),
             model,
         })
     }
@@ -287,7 +286,7 @@ pub fn main() -> Result<(), Box<dyn Error>> {
             let frames = &mut *model_data.frames.lock().unwrap();
             metrics::record_learning_rate(lr);
 
-            _train_loop(
+            _train_policy_phase(
                 &mut adam,
                 &mut *model_data.model.lock().unwrap(),
                 frames,
@@ -295,10 +294,34 @@ pub fn main() -> Result<(), Box<dyn Error>> {
                 &model_data.name,
             );
 
-            frames.clear();
             model_data.save_model(epoch)?;
             metrics::record_training_duration((Instant::now() - st).as_secs_f64());
             metrics::record_frame_buffer_count(frames.len());
+        }
+
+        for model_data in models.iter_mut() {
+            println!("Copying frames into auxiliary.");
+            let curr_batch = &mut *model_data.frames.lock().unwrap();
+            let combined = &mut *model_data.auxiliary_frames.lock().unwrap();
+            combined.ingest_multiple_games(curr_batch, hypers::AUXILIARY_PHASE_TRAIN_FREQUENCY);
+
+            if epoch % hypers::AUXILIARY_PHASE_TRAIN_FREQUENCY == 0 {
+                let mut adam = nn::Adam::default().build(&model_data.vs, lr).unwrap();
+                metrics::record_learning_rate(lr);
+                println!(
+                    "Running Auxiliary Phase training, frames: {}",
+                    combined.len()
+                );
+
+                _train_auxiliary_phase(
+                    &mut adam,
+                    &mut *model_data.model.lock().unwrap(),
+                    combined,
+                    &model_data.name,
+                );
+
+                combined.clear();
+            }
         }
 
         // lr = hypers::MIN_LEARNING_RATE.max(lr * hypers::LEARNING_RATE_DECAY);
@@ -475,12 +498,7 @@ fn play_game_to_end<'a>(
         let curr_state_batch = curr_state.unsqueeze(0).to(device);
 
         // let map = translate_to_valid_moves_mask(&g, &valid_moves, playing, &mut invalid_moves_mask);
-        let map = translate_to_valid_moves_mask(
-            &g,
-            &valid_moves,
-            playing,
-            &mut invalid_moves_mask,
-        );
+        let map = translate_to_valid_moves_mask(&g, &valid_moves, playing, &mut invalid_moves_mask);
         let invalid_moves_tensor = Tensor::from_slice(&invalid_moves_mask);
 
         let (value, mut policy) = tch::no_grad(|| player.model.value_policy(&curr_state_batch));
@@ -509,7 +527,7 @@ fn play_game_to_end<'a>(
     Ok(winner)
 }
 
-fn _train_loop(
+fn _train_policy_phase(
     adam: &mut Optimizer,
     model: &mut HiveModel,
     frames: &MultipleGames,
@@ -532,10 +550,10 @@ fn _train_loop(
     let mut total_value_count = 0;
 
     model.set_train_mode(true);
-    for _ in 0..hypers::TRAIN_ITERS_PER_BATCH {
+    for _ in 0..hypers::POLICY_PHASE_TRAIN_ITERS {
         batch_count += 1;
         let perms = Tensor::randperm(frames.len() as i64, (Kind::Int64, model.device));
-        let mut should_stop_early = false;
+        let should_stop_early = false;
 
         for start in (0..frames.len()).step_by(hypers::BATCH_SIZE) {
             adam.zero_grad();
@@ -583,7 +601,7 @@ fn _train_loop(
             let approx_kl: f64 = (logp_old - logp).mean(None).try_into().expect("success");
             // Tensor::stack(&[&value_loss, &pi_loss, &entropy_loss], 0).print();
 
-            metrics::record_minibatch_statistics(
+            metrics::record_policy_minibatch_statistics(
                 f64::try_from(&value_loss).unwrap(),
                 f64::try_from(&pi_loss).unwrap(),
                 f64::try_from(&entropy_loss).unwrap(),
@@ -597,12 +615,12 @@ fn _train_loop(
                 - (hypers::PI_LOSS_RATIO * pi_loss)
                 - (entropy_loss_scaling * entropy_loss);
 
-            if approx_kl > hypers::CUTOFF_KL {
-                should_stop_early = true;
-                if batch_count > 1 {
-                    break;
-                }
-            }
+            // if approx_kl > hypers::CUTOFF_KL {
+            //     should_stop_early = true;
+            //     if batch_count > 1 {
+            //         break;
+            //     }
+            // }
 
             loss.backward();
             adam.clip_grad_norm(0.5);
@@ -626,5 +644,85 @@ fn _train_loop(
     adam.zero_grad();
 
     metrics::record_training_batches(batch_count);
+    batch_count as usize
+}
+
+fn _train_auxiliary_phase(
+    adam: &mut Optimizer,
+    model: &mut HiveModel,
+    frames: &MultipleGames,
+    model_name: &str,
+) -> usize {
+    let state_buffer = Tensor::stack(frames.game_state.as_slice(), 0).to(model.device);
+    let mask_buffer = Tensor::stack(frames.invalid_move_mask.as_slice(), 0).to(model.device);
+    let target_value_buffer = Tensor::stack(frames.target_value.as_slice(), 0).to(model.device);
+    const LARGE_NEGATIVE: f64 = -1.0e9;
+
+    let pi_old = tch::no_grad(|| model.policy(&state_buffer))
+        .masked_fill_(&mask_buffer, LARGE_NEGATIVE)
+        .log_softmax(1, None);
+
+    let mut batch_count = 0;
+    // let mut total_value_loss = Tensor::zeros(1, (Kind::Float, model.device));
+    // let mut total_value_count = 0;
+
+    model.set_train_mode(true);
+    for _ in 0..hypers::AUXILIARY_PHASE_TRAIN_ITERS {
+        batch_count += 1;
+        let perms = Tensor::randperm(frames.len() as i64, (Kind::Int64, model.device));
+
+        for start in (0..frames.len()).step_by(hypers::BATCH_SIZE) {
+            adam.zero_grad();
+            let upper = frames.len().min(start + hypers::BATCH_SIZE) as i64;
+            let idxs = perms.i((start as i64)..upper);
+
+            let states = state_buffer.index_select(0, &idxs);
+            let mask = &mask_buffer.index_select(0, &idxs);
+
+            let (values, soft_values, mut policies) = model.value_soft_value_policy(&states);
+            let pi = policies.masked_fill_(&mask, LARGE_NEGATIVE).log_softmax(1, None);
+
+            // Many of the papers normalize the advantages.
+            // In some small scale tests, I'm not seeing a significant advantage in our model.
+            // my guess is that it's because the rewards are bounded
+            // let adv = (&adv - adv.mean(None)) / (adv.std(false) + 1e-8);
+
+            let pi_old = pi_old.index_select(0, &idxs);
+            let kl = pi.kl_div(&pi_old, tch::Reduction::None, true);
+            let kl_loss = kl.sum_dim_intlist(1, false, None).mean(None);
+
+            let soft_value_loss = (soft_values - target_value_buffer.index_select(0, &idxs))
+                .square()
+                .mean(None);
+
+            let value_loss = (values - target_value_buffer.index_select(0, &idxs))
+                .square()
+                .mean(None);
+
+            metrics::record_auxiliary_minibatch_statistics(
+                f64::try_from(&value_loss).unwrap(),
+                f64::try_from(&soft_value_loss).unwrap(),
+                f64::try_from(&kl_loss).unwrap(),
+                model_name,
+            );
+
+            let loss: Tensor = soft_value_loss
+                + hypers::AUXILIARY_VALUE_SCALE * value_loss
+                + hypers::AUXILIARY_BETA_CLONE * kl_loss;
+
+            loss.backward();
+            adam.step();
+        }
+    }
+
+    model.set_train_mode(false);
+
+    // let mse = total_value_loss / total_value_count;
+    // mse.print();
+    // let mse: f64 = mse.try_into().unwrap();
+
+    // metrics::record_value_mse(mse);
+
+    // metrics::record_training_batches(batch_count);
     batch_count as usize
 }

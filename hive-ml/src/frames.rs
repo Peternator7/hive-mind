@@ -1,5 +1,4 @@
 use hive_engine::piece::Color;
-use rand::{rngs::StdRng, SeedableRng};
 use tch::Tensor;
 
 use crate::hypers;
@@ -17,10 +16,6 @@ pub struct MultipleGames {
     /// Not time discounted.
     pub gae: Vec<Tensor>,
     pub target_value: Vec<Tensor>,
-
-    /// A reusable buffer so that we can sample frames from played games more randomly.
-    _sample_buffer: Vec<usize>,
-    _rng: StdRng,
 }
 
 impl Default for MultipleGames {
@@ -31,8 +26,6 @@ impl Default for MultipleGames {
             invalid_move_mask: Default::default(),
             gae: Default::default(),
             target_value: Default::default(),
-            _sample_buffer: Default::default(),
-            _rng: StdRng::from_seed([0; 32]),
         }
     }
 }
@@ -56,6 +49,18 @@ impl MultipleGames {
             && len == self.invalid_move_mask.len()
             && len == self.gae.len()
             && len == self.target_value.len()
+    }
+
+    pub fn ingest_multiple_games(&mut self, other: &mut MultipleGames, step_by: usize) {
+        self.game_state
+            .extend(other.game_state.drain(..).step_by(step_by));
+        self.selected_policy
+            .extend(other.selected_policy.drain(..).step_by(step_by));
+        self.invalid_move_mask
+            .extend(other.invalid_move_mask.drain(..).step_by(step_by));
+        self.gae.extend(other.gae.drain(..).step_by(step_by));
+        self.target_value
+            .extend(other.target_value.drain(..).step_by(step_by));
     }
 
     pub fn ingest_game(

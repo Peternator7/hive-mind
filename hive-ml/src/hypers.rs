@@ -11,7 +11,7 @@ pub const EPSILON: f64 = 0.20;
 
 /// Number of games to run in parallel when training/testing.
 pub const PARALLEL_GAMES: usize = 8;
-pub const NUMBER_OF_MODELS: usize = 4;
+pub const NUMBER_OF_MODELS: usize = 1;
 pub const MODEL_NAMES: &'static [&'static str] = &[
     "model_a", "model_b", "model_c", "model_d", "model_e", "model_f", "model_g", "model_h",
 ];

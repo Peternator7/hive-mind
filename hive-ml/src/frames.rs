@@ -1,4 +1,5 @@
 use hive_engine::piece::Color;
+use rand::{rngs::SmallRng, SeedableRng};
 use tch::Tensor;
 
 use crate::hypers;
@@ -16,6 +17,16 @@ pub struct MultipleGames {
     /// Not time discounted.
     pub gae: Vec<Tensor>,
     pub target_value: Vec<Tensor>,
+    rng: SmallRng,
+}
+
+struct Frame {
+    td_error: f64,
+    game_state: Tensor,
+    selected_policy: Tensor,
+    invalid_move_mask: Tensor,
+    gae: Tensor,
+    target_value: Tensor,
 }
 
 impl Default for MultipleGames {
@@ -26,6 +37,7 @@ impl Default for MultipleGames {
             invalid_move_mask: Default::default(),
             gae: Default::default(),
             target_value: Default::default(),
+            rng: rand::rngs::SmallRng::from_seed(Default::default()),
         }
     }
 }
@@ -85,6 +97,7 @@ impl MultipleGames {
         let mut value = std::mem::take(&mut other.value);
 
         let mut gae_values = Vec::with_capacity(value.len());
+        let mut td_error = Vec::with_capacity(value.len());
 
         let mut gae = match winner {
             None if stalled => Tensor::from(hypers::PENALTY_FOR_TIMING_OUT),
@@ -99,6 +112,7 @@ impl MultipleGames {
             if idx == value.len() - 1 {
                 gae = gae - &value[idx];
                 gae_values.push(gae.copy());
+                td_error.push(f64::try_from((&discounted_rewards - &value[idx]).square()).unwrap());
                 continue;
             }
 
@@ -106,43 +120,75 @@ impl MultipleGames {
             value[idx + 1] = discounted_rewards.copy();
             discounted_rewards = discounted_rewards * gamma;
 
-            gae = delta + gl * &gae;
-            // We apply an additional penalty for moves in very long running games.
-            // because there's a reasonable argument that they didn't accomplish very much.
-            gae_values.push(gae.clamp(-1.0, 1.0));
-
-            // distance_to_end += 1;
+            gae = (delta + gl * &gae).clamp(-1.0, 1.0);
+            gae_values.push(gae.copy());
+            td_error.push(f64::try_from((&discounted_rewards - &value[idx]).square()).unwrap());
         }
 
         value[0] = discounted_rewards;
 
         gae_values.reverse();
+        td_error.reverse();
 
-        let mut samples_to_skip = 0;
-        if value.len() > 2 * max_frames_per_game {
-            samples_to_skip = value.len() - 2 * max_frames_per_game;
+        let game_state = other.game_state.drain(..);
+        let mut selected_policy = other.selected_policy.drain(..);
+        let mut invalid_move_mask = other.invalid_move_mask.drain(..);
+        let mut value = value.into_iter();
+        let mut gae_values = gae_values.into_iter();
+        let mut td_error = td_error.into_iter();
+
+        let mut row_major_frames = Vec::new();
+        for game_state in game_state {
+            row_major_frames.push(Some(Frame {
+                game_state,
+                selected_policy: selected_policy.next().unwrap(),
+                invalid_move_mask: invalid_move_mask.next().unwrap(),
+                target_value: value.next().unwrap(),
+                gae: gae_values.next().unwrap(),
+                td_error: td_error.next().unwrap(),
+            }))
         }
 
-        self.game_state
-            .extend(other.game_state.drain(..).skip(samples_to_skip).step_by(2));
-        self.selected_policy.extend(
-            other
-                .selected_policy
-                .drain(..)
-                .skip(samples_to_skip)
-                .step_by(2),
-        );
-        self.invalid_move_mask.extend(
-            other
-                .invalid_move_mask
-                .drain(..)
-                .skip(samples_to_skip)
-                .step_by(2),
-        );
-        self.target_value
-            .extend(value.into_iter().skip(samples_to_skip).step_by(2));
-        self.gae
-            .extend(gae_values.into_iter().skip(samples_to_skip).step_by(2));
+        let indices = rand::seq::index::sample_weighted(
+            &mut self.rng,
+            row_major_frames.len(),
+            |i| row_major_frames[i].as_ref().unwrap().td_error,
+            row_major_frames.len().min(max_frames_per_game),
+        )
+        .unwrap();
+        for idx in indices {
+            let frame = row_major_frames[idx].take().unwrap();
+            self.game_state.push(frame.game_state);
+            self.selected_policy.push(frame.selected_policy);
+            self.invalid_move_mask.push(frame.invalid_move_mask);
+            self.gae.push(frame.gae);
+            self.target_value.push(frame.target_value);
+        }
+
+        // let mut samples_to_skip = 0;
+        // if value.len() > 2 * max_frames_per_game {
+        //     samples_to_skip = value.len() - 2 * max_frames_per_game;
+        // }
+        // self.game_state
+        //     .extend(other.game_state.drain(..).skip(samples_to_skip).step_by(2));
+        // self.selected_policy.extend(
+        //     other
+        //         .selected_policy
+        //         .drain(..)
+        //         .skip(samples_to_skip)
+        //         .step_by(2),
+        // );
+        // self.invalid_move_mask.extend(
+        //     other
+        //         .invalid_move_mask
+        //         .drain(..)
+        //         .skip(samples_to_skip)
+        //         .step_by(2),
+        // );
+        // self.target_value
+        //     .extend(value.into_iter().skip(samples_to_skip).step_by(2));
+        // self.gae
+        //     .extend(gae_values.into_iter().skip(samples_to_skip).step_by(2));
 
         other.playing.take();
 

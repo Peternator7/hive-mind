@@ -6,7 +6,7 @@ edition = "2021"
 [dependencies]
 tch = "0.19.0"
 hive-engine = { path = "../hive-engine" }
-rand = "*"
+rand = { version="*", features=["small_rng"] }
 chrono = "*"
 opentelemetry = "*"
 opentelemetry_sdk = "*"

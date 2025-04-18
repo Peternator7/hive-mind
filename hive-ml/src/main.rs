@@ -679,8 +679,10 @@ fn _train_auxiliary_phase(
             let states = state_buffer.index_select(0, &idxs);
             let mask = &mask_buffer.index_select(0, &idxs);
 
-            let (values, soft_values, mut policies) = model.value_soft_value_policy(&states);
-            let pi = policies.masked_fill_(&mask, LARGE_NEGATIVE).log_softmax(1, None);
+            let (values, mut policies) = model.value_policy_auxiliary(&states);
+            let pi = policies
+                .masked_fill_(&mask, LARGE_NEGATIVE)
+                .log_softmax(1, None);
 
             // Many of the papers normalize the advantages.
             // In some small scale tests, I'm not seeing a significant advantage in our model.
@@ -691,24 +693,19 @@ fn _train_auxiliary_phase(
             let kl = pi.kl_div(&pi_old, tch::Reduction::None, true);
             let kl_loss = kl.sum_dim_intlist(1, false, None).mean(None);
 
-            let soft_value_loss = (soft_values - target_value_buffer.index_select(0, &idxs))
-                .square()
-                .mean(None);
-
             let value_loss = (values - target_value_buffer.index_select(0, &idxs))
                 .square()
                 .mean(None);
 
             metrics::record_auxiliary_minibatch_statistics(
                 f64::try_from(&value_loss).unwrap(),
-                f64::try_from(&soft_value_loss).unwrap(),
+                0.0,
                 f64::try_from(&kl_loss).unwrap(),
                 model_name,
             );
 
-            let loss: Tensor = soft_value_loss
-                + hypers::AUXILIARY_VALUE_SCALE * value_loss
-                + hypers::AUXILIARY_BETA_CLONE * kl_loss;
+            let loss: Tensor =
+                hypers::AUXILIARY_VALUE_SCALE * value_loss + hypers::AUXILIARY_BETA_CLONE * kl_loss;
 
             loss.backward();
             adam.step();

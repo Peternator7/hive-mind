@@ -194,6 +194,34 @@ pub fn increment_move_made(mv: Move, model_color: Color, model_name: &str, oppon
     );
 }
 
+
+pub fn increment_novel_position(model_color: Color, model_name: &str, opponent_name: &str) {
+    static METRIC: OnceLock<Counter<u64>> = OnceLock::new();
+
+    let metric = METRIC.get_or_init(|| {
+        let meter = opentelemetry::global::meter_with_scope(scope().clone());
+
+        meter
+            .u64_counter("new_positions_found_total")
+            .with_description("a counter for every novel position found.")
+            .build()
+    });
+
+    let color = match model_color {
+        Color::Black => "black",
+        Color::White => "white",
+    };
+
+    metric.add(
+        1,
+        &[
+            KeyValue::new("model_color", color),
+            KeyValue::new("model_name", model_name.to_string()),
+            KeyValue::new("opponent_name", opponent_name.to_string()),
+        ],
+    );
+}
+
 pub fn record_game_turns(
     game_turns: usize,
     model_color: Color,
@@ -278,6 +306,45 @@ pub fn record_game_duration(
             KeyValue::new("model_color", opponent_color),
             KeyValue::new("model_name", opponent_name.to_string()),
             KeyValue::new("opponent_name", model_name.to_string()),
+        ],
+    );
+}
+
+pub fn record_frames_sampled_per_game(
+    frame_count: usize,
+    model_color: Color,
+    winner: Option<Color>,
+    stalled: bool,
+) {
+    static METRIC: OnceLock<Histogram<u64>> = OnceLock::new();
+
+    let metric = METRIC.get_or_init(|| {
+        let meter = opentelemetry::global::meter_with_scope(scope().clone());
+
+        meter
+            .u64_histogram("frame_buffer_ingestion_per_game")
+            .with_boundaries((0..21).map(|x| x as f64 * 5.0).collect())
+            .with_description("the number of frames ingested.")
+            .build()
+    });
+
+    let winner = match winner {
+        Some(Color::Black) => "black",
+        Some(Color::White) => "white",
+        None if stalled => "stalled",
+        None => "draw",
+    };
+
+    let color = match model_color {
+        Color::Black => "black",
+        Color::White => "white",
+    };
+
+    metric.record(
+        frame_count as u64,
+        &[
+            KeyValue::new("model_color", color),
+            KeyValue::new("winner", winner),
         ],
     );
 }
@@ -411,8 +478,7 @@ pub fn record_policy_minibatch_statistics(
     value_loss: f64,
     policy_loss: f64,
     entropy_loss: f64,
-    pi_ratio: f64,
-    pi_adv: f64,
+    novelty_loss: f64,
     approximate_kl: f64,
     model_name: &str,
 ) {
@@ -420,6 +486,7 @@ pub fn record_policy_minibatch_statistics(
     static TRAINING_VALUE_LOSS_TOTAL: OnceLock<Counter<f64>> = OnceLock::new();
     static TRAINING_POLICY_LOSS_TOTAL: OnceLock<Counter<f64>> = OnceLock::new();
     static TRAINING_ENTROPY_LOSS_TOTAL: OnceLock<Counter<f64>> = OnceLock::new();
+    static TRAINING_NOVELTY_LOSS_TOTAL: OnceLock<Counter<f64>> = OnceLock::new();
     static TRAINING_PI_RATIO_TOTAL: OnceLock<Counter<f64>> = OnceLock::new();
     static TRAINING_PI_ADV_TOTAL: OnceLock<Counter<f64>> = OnceLock::new();
     static TRAINING_APPROXIMATE_KL_GAUGE: OnceLock<Gauge<f64>> = OnceLock::new();
@@ -460,7 +527,16 @@ pub fn record_policy_minibatch_statistics(
             .build()
     });
 
-    let training_pi_ratio_total = TRAINING_PI_RATIO_TOTAL.get_or_init(|| {
+    let training_novelty_loss_total = TRAINING_NOVELTY_LOSS_TOTAL.get_or_init(|| {
+        let meter = opentelemetry::global::meter_with_scope(scope().clone());
+
+        meter
+            .f64_counter("training_novelty_loss_total")
+            .with_description("a counter for the total novelty loss (RND) during training.")
+            .build()
+    });
+
+    let _training_pi_ratio_total = TRAINING_PI_RATIO_TOTAL.get_or_init(|| {
         let meter = opentelemetry::global::meter_with_scope(scope().clone());
 
         meter
@@ -469,7 +545,7 @@ pub fn record_policy_minibatch_statistics(
             .build()
     });
 
-    let training_pi_adv_total = TRAINING_PI_ADV_TOTAL.get_or_init(|| {
+    let _training_pi_adv_total = TRAINING_PI_ADV_TOTAL.get_or_init(|| {
         let meter = opentelemetry::global::meter_with_scope(scope().clone());
 
         meter
@@ -500,16 +576,12 @@ pub fn record_policy_minibatch_statistics(
         entropy_loss,
         &[KeyValue::new("model_name", model_name.to_string())],
     );
+    training_novelty_loss_total.add(
+        novelty_loss,
+        &[KeyValue::new("model_name", model_name.to_string())],
+    );
     training_approximate_kl_gauge.record(
         approximate_kl,
-        &[KeyValue::new("model_name", model_name.to_string())],
-    );
-    training_pi_ratio_total.add(
-        pi_ratio,
-        &[KeyValue::new("model_name", model_name.to_string())],
-    );
-    training_pi_adv_total.add(
-        pi_adv,
         &[KeyValue::new("model_name", model_name.to_string())],
     );
 }

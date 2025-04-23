@@ -1,4 +1,4 @@
-use crate::hypers::{INPUT_ENCODED_DIMS, OUTPUT_LENGTH};
+use crate::hypers;
 use tch::{nn, Tensor};
 
 pub struct HiveModel {
@@ -9,6 +9,10 @@ pub struct HiveModel {
     residual_blocks: Vec<(tch::nn::Conv2D, tch::nn::BatchNorm)>,
     policy_layer: tch::nn::Sequential,
     value_layer: tch::nn::Sequential,
+
+    in_value_layer: tch::nn::Sequential,
+    in_distill_layer: tch::nn::Sequential,
+    in_random_layer: tch::nn::Sequential,
 }
 
 impl HiveModel {
@@ -20,7 +24,7 @@ impl HiveModel {
         //     ..Default::default()
         //};
 
-        let input_encoded_dims = INPUT_ENCODED_DIMS as i64;
+        let input_encoded_dims = hypers::INPUT_ENCODED_DIMS as i64;
         let channels = 64;
 
         let conv_i = tch::nn::conv2d(
@@ -59,6 +63,13 @@ impl HiveModel {
             .collect::<Vec<_>>();
 
         let dims_after_conv = 2304;
+        let policy_layer = nn::seq().add(nn::linear(
+            p / "a" / "l1",
+            dims_after_conv,
+            hypers::OUTPUT_LENGTH as i64,
+            Default::default(),
+        ));
+
         let value_layer = nn::seq()
             .add(nn::linear(
                 p / "c" / "l1",
@@ -68,16 +79,43 @@ impl HiveModel {
             ))
             .add_fn(|xs| xs.tanh());
 
-        let policy_layer = nn::seq().add(nn::linear(
-            p / "a" / "l2",
+        // Layers for calculating the distillation + intrinsic rewards.
+        let in_value_layer = nn::seq().add(nn::linear(
+            p / "in" / "l1",
             dims_after_conv,
-            OUTPUT_LENGTH as i64,
+            1,
             Default::default(),
         ));
+
+        let in_random_layer = nn::seq()
+            .add(nn::conv2d(
+                p / "in" / "r1",
+                input_encoded_dims,
+                1,
+                1,
+                Default::default(),
+            ))
+            .add_fn(|xs| xs.flat_view())
+            .add(nn::linear(p / "in" / "l2", 26 * 26, 1, Default::default()));
+
+        let in_distill_layer = nn::seq()
+            .add(nn::conv2d(
+                p / "in" / "r1",
+                input_encoded_dims,
+                1,
+                1,
+                Default::default(),
+            ))
+            .add_fn(|xs| xs.relu())
+            .add_fn(|xs| xs.flat_view())
+            .add(nn::linear(p / "in" / "l2", 26 * 26, 1, Default::default()));
 
         Self {
             policy_layer,
             value_layer,
+            in_value_layer,
+            in_distill_layer,
+            in_random_layer,
             conv_i,
             bn_i,
             residual_blocks,
@@ -94,17 +132,29 @@ impl HiveModel {
         )
     }
 
-    pub fn value_policy_auxiliary(&self, game_state: &Tensor) -> (Tensor, Tensor) {
+    pub fn value_intrinsic_value_policy(&self, game_state: &Tensor) -> (Tensor, Tensor, Tensor) {
         let t = self.shared_layers(game_state);
         (
-            t.apply(&self.value_layer),
+            t.detach().apply(&self.value_layer),
+            t.detach().apply(&self.in_value_layer),
             t.apply(&self.policy_layer),
         )
+    }
+
+    pub fn value_policy_auxiliary(&self, game_state: &Tensor) -> (Tensor, Tensor) {
+        let t = self.shared_layers(game_state);
+        (t.apply(&self.value_layer), t.apply(&self.policy_layer))
     }
 
     pub fn policy(&self, game_state: &Tensor) -> Tensor {
         let t = self.shared_layers(game_state);
         t.apply(&self.policy_layer)
+    }
+
+    pub fn novelty(&self, game_state: &Tensor) -> Tensor {
+        let distilled = game_state.apply(&self.in_distill_layer);
+        let random = game_state.apply(&self.in_random_layer).detach();
+        (distilled - random).square()
     }
 
     pub fn set_train_mode(&mut self, train_mode: bool) {

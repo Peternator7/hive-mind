@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use hive_engine::piece::Color;
 use rand::{rngs::SmallRng, SeedableRng};
 use tch::Tensor;
@@ -17,10 +19,17 @@ pub struct MultipleGames {
     /// Not time discounted.
     pub gae: Vec<Tensor>,
     pub target_value: Vec<Tensor>,
+
+    game_id: usize,
+    lowest_game_id: usize,
+    game_lengths: HashMap<usize, (usize, Color, Option<Color>, bool)>,
+    frame_buffer: Vec<Option<Frame>>,
     rng: SmallRng,
 }
 
+#[derive(Debug)]
 struct Frame {
+    game_id: usize,
     td_error: f64,
     game_state: Tensor,
     selected_policy: Tensor,
@@ -37,6 +46,10 @@ impl Default for MultipleGames {
             invalid_move_mask: Default::default(),
             gae: Default::default(),
             target_value: Default::default(),
+            game_id: 0,
+            lowest_game_id: 0,
+            game_lengths: Default::default(),
+            frame_buffer: Default::default(),
             rng: rand::rngs::SmallRng::from_seed(Default::default()),
         }
     }
@@ -49,6 +62,8 @@ impl MultipleGames {
         self.invalid_move_mask.clear();
         self.gae.clear();
         self.target_value.clear();
+        self.frame_buffer.clear();
+        self.game_lengths.clear();
     }
 
     pub fn len(&self) -> usize {
@@ -130,6 +145,13 @@ impl MultipleGames {
         gae_values.reverse();
         td_error.reverse();
 
+        self.game_lengths.entry(self.game_id).insert_entry((
+            other.game_state.len(),
+            playing,
+            winner,
+            stalled,
+        ));
+
         let game_state = other.game_state.drain(..);
         let mut selected_policy = other.selected_policy.drain(..);
         let mut invalid_move_mask = other.invalid_move_mask.drain(..);
@@ -137,9 +159,9 @@ impl MultipleGames {
         let mut gae_values = gae_values.into_iter();
         let mut td_error = td_error.into_iter();
 
-        let mut row_major_frames = Vec::new();
         for game_state in game_state {
-            row_major_frames.push(Some(Frame {
+            self.frame_buffer.push(Some(Frame {
+                game_id: self.game_id,
                 game_state,
                 selected_policy: selected_policy.next().unwrap(),
                 invalid_move_mask: invalid_move_mask.next().unwrap(),
@@ -149,20 +171,47 @@ impl MultipleGames {
             }))
         }
 
-        let indices = rand::seq::index::sample_weighted(
-            &mut self.rng,
-            row_major_frames.len(),
-            |i| row_major_frames[i].as_ref().unwrap().td_error,
-            row_major_frames.len().min(max_frames_per_game),
-        )
-        .unwrap();
-        for idx in indices {
-            let frame = row_major_frames[idx].take().unwrap();
-            self.game_state.push(frame.game_state);
-            self.selected_policy.push(frame.selected_policy);
-            self.invalid_move_mask.push(frame.invalid_move_mask);
-            self.gae.push(frame.gae);
-            self.target_value.push(frame.target_value);
+        self.game_id += 1;
+
+        if self.frame_buffer.len() >= hypers::TARGET_FRAMES_PER_SAMPLING {
+            let mut frame_counts: HashMap<_, _> = (self.lowest_game_id..self.game_id)
+                .map(|x| (x, 0))
+                .collect();
+
+            let target_count = (self.game_id - self.lowest_game_id) * max_frames_per_game;
+            let indices = rand::seq::index::sample_weighted(
+                &mut self.rng,
+                self.frame_buffer.len(),
+                |i| self.frame_buffer[i].as_ref().unwrap().td_error,
+                self.frame_buffer.len().min(target_count),
+            )
+            .unwrap();
+
+            // println!(
+            //     "Games: {}, Frames: {}, Ingestion Target:{}",
+            //     self.game_id - self.lowest_game_id,
+            //     self.frame_buffer.len(),
+            //     target_count
+            // );
+            for idx in indices {
+                let frame = self.frame_buffer[idx].take().unwrap();
+                *frame_counts.entry(frame.game_id).or_default() += 1;
+
+                self.game_state.push(frame.game_state);
+                self.selected_policy.push(frame.selected_policy);
+                self.invalid_move_mask.push(frame.invalid_move_mask);
+                self.gae.push(frame.gae);
+                self.target_value.push(frame.target_value);
+            }
+
+            for (game_id, count) in frame_counts {
+                let (_, playing, winner, stalled) = self.game_lengths.remove(&game_id).unwrap();
+                crate::metrics::record_frames_sampled_per_game(count, playing, winner, stalled);
+            }
+
+            self.game_lengths.clear();
+            self.frame_buffer.clear();
+            self.lowest_game_id = self.game_id;
         }
 
         // let mut samples_to_skip = 0;

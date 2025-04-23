@@ -11,17 +11,20 @@ use hive_engine::position::Position;
 use hive_engine::{game::Game, piece::Color};
 use hive_ml::encode::{translate_game_to_conv_tensor, translate_to_valid_moves_mask};
 use hive_ml::metrics;
+use hive_ml::seen::SeenPositions;
 use hive_ml::{
     frames::{MultipleGames, SingleGame},
     hypers::{self},
     model::HiveModel,
 };
-use rand::seq::SliceRandom;
+use rand::seq::{IndexedRandom, SliceRandom};
 use tch::nn::{Optimizer, OptimizerConfig, VarStore};
 use tch::{nn, IndexOp, Kind, Tensor};
 
 // input data shape should be [batch, channels, rows, cols]
 // output data shape should be [batch, ]
+
+static MAX_TURNS_PER_GAME: AtomicUsize = AtomicUsize::new(hypers::MAX_TURNS_PER_GAME);
 
 struct ModelData {
     name: String,
@@ -35,6 +38,7 @@ struct PlayerGameData<'a> {
     name: &'a str,
     model: &'a HiveModel,
     samples: &'a mut SingleGame,
+    seen: Option<&'a Mutex<SeenPositions>>,
 }
 
 impl ModelData {
@@ -89,12 +93,12 @@ pub fn main() -> Result<(), Box<dyn Error>> {
     }
 
     let mut lr = hypers::INITIAL_LEARNING_RATE;
-    let entropy_loss_factor = hypers::ENTROPY_LOSS_RATIO;
-    let max_frames_per_game = hypers::MAX_FRAMES_PER_GAME;
+    let max_frames_per_game = hypers::TARGET_FRAMES_PER_GAME;
     let quantiles = Tensor::from_slice(&[0.5f32, 0.8f32, 0.99f32]);
+    // let seen = &Some(Mutex::new(SeenPositions::new(8)));
 
     println!("Starting train loop");
-    let mut main_rng = rand::thread_rng();
+    let mut main_rng = rand::rng();
     for epoch in 1..hypers::EPOCHS {
         metrics::record_epoch(epoch);
         models.shuffle(&mut main_rng);
@@ -124,7 +128,7 @@ pub fn main() -> Result<(), Box<dyn Error>> {
                                 opponents.push(opponent);
                             }
 
-                            let mut rng = rand::thread_rng();
+                            let mut rng = rand::rng();
                             let samples = &mut SingleGame::default();
                             let opponent_samples = &mut SingleGame::default();
 
@@ -150,24 +154,28 @@ pub fn main() -> Result<(), Box<dyn Error>> {
                                         name: model_data.name.as_str(),
                                         samples: samples,
                                         model: thread_model,
+                                        seen: None,
                                     };
 
                                     black_model = PlayerGameData {
                                         name: opponent_name,
                                         samples: opponent_samples,
                                         model: opponent,
+                                        seen: None,
                                     };
                                 } else {
                                     black_model = PlayerGameData {
                                         name: model_data.name.as_str(),
                                         samples: samples,
                                         model: thread_model,
+                                        seen: None,
                                     };
 
                                     white_model = PlayerGameData {
                                         name: opponent_name,
                                         samples: opponent_samples,
                                         model: opponent,
+                                        seen: None,
                                     };
                                 };
 
@@ -290,7 +298,6 @@ pub fn main() -> Result<(), Box<dyn Error>> {
                 &mut adam,
                 &mut *model_data.model.lock().unwrap(),
                 frames,
-                entropy_loss_factor,
                 &model_data.name,
             );
 
@@ -324,8 +331,15 @@ pub fn main() -> Result<(), Box<dyn Error>> {
             }
         }
 
-        // lr = hypers::MIN_LEARNING_RATE.max(lr * hypers::LEARNING_RATE_DECAY);
         lr -= hypers::LEARNING_RATE_DECREASE;
+
+        let new_max_turns = hypers::MIN_MAX_TURNS_PER_GAME.max(
+            MAX_TURNS_PER_GAME.load(Ordering::Relaxed)
+                - hypers::MAX_TURNS_PER_GAME_DECREASE_PER_EPOCH,
+        );
+        MAX_TURNS_PER_GAME.store(new_max_turns, Ordering::Relaxed);
+
+        // seen.as_ref().unwrap().lock().unwrap().advance_generation();
 
         if epoch % 10 == 0 {
             for model_data in models.iter() {
@@ -359,12 +373,14 @@ pub fn main() -> Result<(), Box<dyn Error>> {
                                         model: &thread_model,
                                         name: &model_data.name,
                                         samples: &mut Default::default(),
+                                        seen: None,
                                     };
 
                                     let mut old_player = PlayerGameData {
                                         model: &old_model,
                                         name: "model_old",
                                         samples: &mut Default::default(),
+                                        seen: None,
                                     };
 
                                     last_iter_failed = false;
@@ -459,7 +475,7 @@ fn play_game_to_end<'a>(
             (&mut *black_player, &mut *white_player)
         };
 
-        if g.turn() == hypers::MAX_TURNS_PER_GAME {
+        if g.turn() == MAX_TURNS_PER_GAME.load(Ordering::Relaxed) {
             return Err(HiveError::TurnLimitHit);
         }
 
@@ -510,6 +526,14 @@ fn play_game_to_end<'a>(
         let mv = map.get(&(action_prob as usize)).expect("populated above.");
         g.make_move(*mv)?;
 
+        if player
+            .seen
+            .map(|mx| mx.lock().unwrap().is_unseen_position(&g))
+            .unwrap_or(false)
+        {
+            metrics::increment_novel_position(playing, player.name, opponent.name);
+        }
+
         player.samples.game_state.push(curr_state);
         player.samples.invalid_move_mask.push(invalid_moves_tensor);
         player
@@ -531,7 +555,6 @@ fn _train_policy_phase(
     adam: &mut Optimizer,
     model: &mut HiveModel,
     frames: &MultipleGames,
-    entropy_loss_scaling: f64,
     model_name: &str,
 ) -> usize {
     let state_buffer = Tensor::stack(frames.game_state.as_slice(), 0).to(model.device);
@@ -582,8 +605,6 @@ fn _train_policy_phase(
             let logp_old = logp_old.index_select(0, &idxs);
 
             let ratio = (&logp - &logp_old).exp_();
-            let ratio_f = f64::try_from(ratio.mean(None)).unwrap();
-            let adv_f = f64::try_from(adv.mean(None)).unwrap();
             let clip_adv = ratio.clamp(1.0 - hypers::EPSILON, 1.0 + hypers::EPSILON) * &adv;
 
             let pi_loss = (ratio * adv).minimum(&clip_adv).mean(None);
@@ -591,6 +612,8 @@ fn _train_policy_phase(
             let value_loss = (values - target_value_buffer.index_select(0, &idxs))
                 .square()
                 .mean(None);
+
+            let novelty_loss = model.novelty(&states).mean(None);
 
             total_value_loss = tch::no_grad(|| total_value_loss + &value_loss);
             total_value_count += 1;
@@ -605,15 +628,15 @@ fn _train_policy_phase(
                 f64::try_from(&value_loss).unwrap(),
                 f64::try_from(&pi_loss).unwrap(),
                 f64::try_from(&entropy_loss).unwrap(),
-                ratio_f,
-                adv_f,
+                f64::try_from(&novelty_loss).unwrap(),
                 approx_kl,
                 model_name,
             );
 
             let loss: Tensor = value_loss
-                - (hypers::PI_LOSS_RATIO * pi_loss)
-                - (entropy_loss_scaling * entropy_loss);
+                - hypers::PI_LOSS_RATIO * pi_loss
+                - hypers::ENTROPY_LOSS_RATIO * entropy_loss
+                + hypers::NOVELTY_LOSS_RATIO * novelty_loss;
 
             // if approx_kl > hypers::CUTOFF_KL {
             //     should_stop_early = true;

@@ -4,7 +4,6 @@ pub mod model;
 pub mod model2;
 pub mod encode;
 pub mod metrics;
-pub mod seen;
 
 pub trait TrainableFromFrames {
     fn extract_mask_tensor(&self, frames: &frames::MultipleGames) -> tch::Tensor;

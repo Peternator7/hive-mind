@@ -183,25 +183,32 @@ impl MultipleGames {
                 &mut self.rng,
                 self.frame_buffer.len(),
                 |i| self.frame_buffer[i].as_ref().unwrap().td_error,
-                self.frame_buffer.len().min(target_count),
+                self.frame_buffer.len(),
             )
             .unwrap();
 
-            // println!(
-            //     "Games: {}, Frames: {}, Ingestion Target:{}",
-            //     self.game_id - self.lowest_game_id,
-            //     self.frame_buffer.len(),
-            //     target_count
-            // );
+            let mut ingested = 0;
+
+            let frame_cap = (1.5 * max_frames_per_game as f64) as usize;
             for idx in indices {
                 let frame = self.frame_buffer[idx].take().unwrap();
-                *frame_counts.entry(frame.game_id).or_default() += 1;
+                let frame_count = frame_counts.entry(frame.game_id).or_default();
+                if *frame_count >= frame_cap {
+                    continue;
+                }
+
+                *frame_count += 1;
 
                 self.game_state.push(frame.game_state);
                 self.selected_policy.push(frame.selected_policy);
                 self.invalid_move_mask.push(frame.invalid_move_mask);
                 self.gae.push(frame.gae);
                 self.target_value.push(frame.target_value);
+
+                ingested += 1;
+                if ingested >= target_count {
+                    break;
+                }
             }
 
             for (game_id, count) in frame_counts {

@@ -16,7 +16,7 @@ use hive_ml::{
     hypers::{self},
     model::HiveModel,
 };
-use rand::seq::SliceRandom;
+use rand::seq::{IndexedRandom, SliceRandom};
 use tch::nn::{Optimizer, OptimizerConfig, VarStore};
 use tch::{nn, IndexOp, Kind, Tensor};
 

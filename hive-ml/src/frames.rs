@@ -99,6 +99,7 @@ impl MultipleGames {
         let mut gae_values = Vec::with_capacity(value.len());
         let mut td_error = Vec::with_capacity(value.len());
 
+        // This is the rewards for the final step.
         let mut gae = match winner {
             None if stalled => Tensor::from(hypers::PENALTY_FOR_TIMING_OUT),
             None => Tensor::from(0.0f32),
@@ -116,9 +117,10 @@ impl MultipleGames {
                 continue;
             }
 
-            let delta = gamma * &value[idx + 1] - &value[idx];
+            let curr_step_rewards = -hypers::PENALTY_FOR_MOVING;
+            let delta = gamma * &value[idx + 1] + curr_step_rewards - &value[idx];
             value[idx + 1] = discounted_rewards.copy();
-            discounted_rewards = discounted_rewards * gamma;
+            discounted_rewards = curr_step_rewards + discounted_rewards * gamma;
 
             gae = (delta + gl * &gae).clamp(-1.0, 1.0);
             gae_values.push(gae.copy());

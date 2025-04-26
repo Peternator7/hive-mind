@@ -615,15 +615,8 @@ fn _train_policy_phase(
                 - (hypers::PI_LOSS_RATIO * pi_loss)
                 - (entropy_loss_scaling * entropy_loss);
 
-            // if approx_kl > hypers::CUTOFF_KL {
-            //     should_stop_early = true;
-            //     if batch_count > 1 {
-            //         break;
-            //     }
-            // }
-
             loss.backward();
-            adam.clip_grad_norm(0.5);
+            adam.clip_grad_norm(hypers::GRAD_CLIP);
             adam.step();
         }
 

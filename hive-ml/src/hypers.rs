@@ -57,6 +57,7 @@ pub const PENALTY_FOR_TIMING_OUT: f64 = 0.500;
 pub const APPROXIMATE_TURN_MEMORY: usize = 100;
 pub const GAMMA: f64 = 1.0 - (1.0 / APPROXIMATE_TURN_MEMORY as f64);
 pub const LAMBDA: f64 = 0.90;
+pub const GRAD_CLIP: f64 = 0.50;
 
 pub const MAX_SEQ_LENGTH: i64 = 2 * 11;
 

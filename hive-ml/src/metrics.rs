@@ -407,6 +407,24 @@ pub fn record_win_rate_vs_initial(win_rate: f64, model_name: &str) {
     );
 }
 
+pub fn record_weighted_game_length(length: f64, model_name: &str) {
+    static METRIC: OnceLock<Gauge<f64>> = OnceLock::new();
+
+    let metric = METRIC.get_or_init(|| {
+        let meter = opentelemetry::global::meter_with_scope(scope().clone());
+
+        meter
+            .f64_gauge("weighted_game_length")
+            .with_description("the exponential moving average of game lengths used for sampling frames")
+            .build()
+    });
+
+    metric.record(
+        length,
+        &[KeyValue::new("model_name", model_name.to_string())],
+    );
+}
+
 pub fn record_policy_minibatch_statistics(
     value_loss: f64,
     policy_loss: f64,

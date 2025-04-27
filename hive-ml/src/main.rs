@@ -27,6 +27,7 @@ struct ModelData {
     name: String,
     vs: VarStore,
     frames: Mutex<MultipleGames>,
+    rolling_length: Mutex<f64>,
     auxiliary_frames: Mutex<MultipleGames>,
     model: Mutex<HiveModel>,
 }
@@ -55,6 +56,7 @@ impl ModelData {
             vs,
             frames: Default::default(),
             auxiliary_frames: Default::default(),
+            rolling_length: Mutex::new(hypers::MAX_FRAMES_PER_GAME as f64),
             model,
         })
     }
@@ -90,11 +92,10 @@ pub fn main() -> Result<(), Box<dyn Error>> {
 
     let mut lr = hypers::INITIAL_LEARNING_RATE;
     let entropy_loss_factor = hypers::ENTROPY_LOSS_RATIO;
-    let max_frames_per_game = hypers::MAX_FRAMES_PER_GAME;
     let quantiles = Tensor::from_slice(&[0.5f32, 0.8f32, 0.99f32]);
 
     println!("Starting train loop");
-    let mut main_rng = rand::thread_rng();
+    let mut main_rng = rand::rng();
     for epoch in 1..hypers::EPOCHS {
         metrics::record_epoch(epoch);
         models.shuffle(&mut main_rng);
@@ -124,7 +125,7 @@ pub fn main() -> Result<(), Box<dyn Error>> {
                                 opponents.push(opponent);
                             }
 
-                            let mut rng = rand::thread_rng();
+                            let mut rng = rand::rng();
                             let samples = &mut SingleGame::default();
                             let opponent_samples = &mut SingleGame::default();
 
@@ -216,6 +217,22 @@ pub fn main() -> Result<(), Box<dyn Error>> {
 
                                 games_lengths.lock().unwrap().push(game.turn() as f32);
 
+                                let mut rolling_length = model_data.rolling_length.lock().unwrap();
+                                *rolling_length *= 0.999;
+                                *rolling_length += 0.001 * (game.turn() as f64);
+
+                                let target_frames = rolling_length.clamp(
+                                    hypers::MIN_FRAMES_PER_GAME as f64,
+                                    hypers::MAX_FRAMES_PER_GAME as f64,
+                                ) as usize;
+
+                                metrics::record_weighted_game_length(
+                                    *rolling_length,
+                                    &model_data.name,
+                                );
+
+                                drop(rolling_length); // Release the lock here.
+
                                 let mut frames = model_data.frames.lock().unwrap();
                                 frames.ingest_game(
                                     samples,
@@ -223,7 +240,7 @@ pub fn main() -> Result<(), Box<dyn Error>> {
                                     stalled,
                                     hypers::GAMMA,
                                     hypers::LAMBDA,
-                                    max_frames_per_game,
+                                    target_frames,
                                 );
 
                                 metrics::record_frame_buffer_count(frames.len());
@@ -231,13 +248,32 @@ pub fn main() -> Result<(), Box<dyn Error>> {
 
                                 let mut frames = models[opponent_idx].frames.lock().unwrap();
                                 if frames.len() < hypers::TARGET_FRAMES_PER_BATCH {
+                                    let mut rolling_length =
+                                        models[opponent_idx].rolling_length.lock().unwrap();
+
+                                    *rolling_length *= 0.999;
+                                    *rolling_length += 0.001 * (game.turn() as f64);
+
+                                    let target_frames = rolling_length.clamp(
+                                        hypers::MIN_FRAMES_PER_GAME as f64,
+                                        hypers::MAX_FRAMES_PER_GAME as f64,
+                                    )
+                                        as usize;
+
+                                    metrics::record_weighted_game_length(
+                                        *rolling_length,
+                                        &models[opponent_idx].name,
+                                    );
+
+                                    drop(rolling_length); // Release the lock here.
+
                                     frames.ingest_game(
                                         opponent_samples,
                                         winner,
                                         stalled,
                                         hypers::GAMMA,
                                         hypers::LAMBDA,
-                                        max_frames_per_game,
+                                        target_frames,
                                     );
                                 }
                             }

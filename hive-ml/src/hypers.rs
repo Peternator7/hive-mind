@@ -11,7 +11,7 @@ pub const EPSILON: f64 = 0.20;
 
 /// Number of games to run in parallel when training/testing.
 pub const PARALLEL_GAMES: usize = 8;
-pub const NUMBER_OF_MODELS: usize = 1;
+pub const NUMBER_OF_MODELS: usize = 4;
 pub const MODEL_NAMES: &'static [&'static str] = &[
     "model_a", "model_b", "model_c", "model_d", "model_e", "model_f", "model_g", "model_h",
 ];
@@ -30,10 +30,10 @@ pub const MAX_TURNS_PER_GAME: usize = 500;
 /// are more likely to have affected the outcome than beginning frames.
 /// This also prevents us from learning too much about any one trajectory.
 pub const MAX_FRAMES_PER_GAME: usize = 60;
+pub const MIN_FRAMES_PER_GAME: usize = 15;
 
 /// Max number of iters we'll do on a single batch of data.
 pub const TRAIN_ITERS_PER_BATCH: usize = 2;
-
 
 /// The minibatch size for training.
 pub const BATCH_SIZE: usize = 1024;

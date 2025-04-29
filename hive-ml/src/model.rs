@@ -69,21 +69,19 @@ impl HiveModel {
             .collect::<Vec<_>>();
 
         let dims_after_conv = 2304;
-        let value_layer = nn::seq()
-            .add(nn::linear(
-                p / "c" / "l1",
-                dims_after_conv,
-                1,
-                Default::default(),
-            ));
+        let value_layer = nn::seq().add(nn::linear(
+            p / "c" / "l1",
+            dims_after_conv,
+            1,
+            Default::default(),
+        ));
 
-        let intrinsic_value_layer = nn::seq()
-            .add(nn::linear(
-                p / "ic" / "l1",
-                dims_after_conv,
-                1,
-                Default::default(),
-            ));
+        let intrinsic_value_layer = nn::seq().add(nn::linear(
+            p / "ic" / "l1",
+            dims_after_conv,
+            1,
+            Default::default(),
+        ));
 
         let policy_layer = nn::seq().add(nn::linear(
             p / "a" / "l1",
@@ -107,8 +105,9 @@ impl HiveModel {
     }
 
     pub fn novelty(&self, game_state: &Tensor) -> Tensor {
-        let target = self.random_target.evaluate(game_state).detach();
-        let pred = self.distillation.evaluate(game_state);
+        let shared = self.shared_layers(game_state).detach();
+        let target = self.random_target.evaluate(&shared).detach();
+        let pred = self.distillation.evaluate(&shared);
 
         (target - pred).abs().mean_dim(1, false, None)
     }
@@ -167,17 +166,16 @@ impl RndModel {
     pub fn new(p: nn::Path) -> Self {
         Self {
             layers: nn::seq()
-                .add(nn::conv2d(&p / "c1", INPUT_ENCODED_DIMS as i64, 1, 3, Default::default()))
-                .add_fn(|xs| xs.max_pool2d_default(2))
-                .add_fn(|xs| xs.flat_view())
-                .add_fn(|xs| xs.tanh())
-                .add(nn::linear(&p / "h1", 144, 16, Default::default()))
-                .add_fn(|xs| xs.tanh())
-                .add(nn::linear(&p / "o", 16, 8, Default::default())),
+                .add_fn(|xs| xs.relu())
+                .add(nn::linear(&p / "h1", 2304, 32, Default::default()))
+                .add_fn(|xs| xs.relu())
+                .add(nn::linear(&p / "h2", 32, 32, Default::default()))
+                .add_fn(|xs| xs.relu())
+                .add(nn::linear(&p / "o", 32, 8, Default::default())),
         }
     }
 
-    pub fn evaluate(&self, game_state: &Tensor) -> Tensor {
-        game_state.apply(&self.layers)
+    pub fn evaluate(&self, shared_layers: &Tensor) -> Tensor {
+        shared_layers.apply(&self.layers)
     }
 }

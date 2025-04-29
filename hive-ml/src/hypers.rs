@@ -53,12 +53,12 @@ pub const LEARNING_RATE_DECREASE: f64 = INITIAL_LEARNING_RATE / EPOCHS as f64;
 
 // pub const PENALIZE_TURNS_DISTANCE_FROM_END: isize = 60;
 pub const PENALTY_FOR_MOVING: f64 = 0.01;
-pub const PENALTY_FOR_TIMING_OUT: f64 = 0.500;
+pub const PENALTY_FOR_TIMING_OUT: f64 = 1.500;
 pub const APPROXIMATE_TURN_MEMORY: usize = 100;
 pub const GAMMA: f64 = 1.0 - (1.0 / APPROXIMATE_TURN_MEMORY as f64);
 pub const LAMBDA: f64 = 0.90;
 pub const GRAD_CLIP: f64 = 0.50;
-pub const INTRINSIC_ADV_SCALING: f64 = 0.10;
+pub const INTRINSIC_ADV_SCALING: f64 = 0.1;
 
 pub const MAX_SEQ_LENGTH: i64 = 2 * 11;
 

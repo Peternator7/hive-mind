@@ -554,7 +554,6 @@ fn play_game_to_end<'a>(
         let sampled_action_idx = policy.softmax(-1, None).multinomial(1, true);
         let action_prob: i64 = i64::try_from(&sampled_action_idx).expect("cast");
         let mv = map.get(&(action_prob as usize)).expect("populated above.");
-        g.make_move(*mv)?;
 
         player.samples.game_state.push(curr_state);
         player.samples.invalid_move_mask.push(invalid_moves_tensor);
@@ -584,6 +583,7 @@ fn play_game_to_end<'a>(
                 .push(novelty.view(1i64).to(tch::Device::Cpu));
         }
 
+        g.make_move(*mv)?;
         metrics::increment_move_made(*mv, playing, player.name, opponent.name);
     }
 
@@ -597,13 +597,13 @@ fn play_game_to_end<'a>(
 
         let gw = translate_game_to_conv_tensor(&g, player);
         let gw_batch = gw.unsqueeze(0).to(player_data.model.device);
-        let final_novelty = player_data
-            .model
-            .novelty(&gw_batch)
-            .view(1)
-            .to(tch::Device::Cpu);
+        let final_novelty = tch::no_grad(|| player_data.model.novelty(&gw_batch));
 
-        player_data.samples.novelty.push(final_novelty);
+        player_data
+            .samples
+            .novelty
+            .push(final_novelty.view(1).to(tch::Device::Cpu));
+
         assert!(player_data.samples.validate_buffers());
     }
 
@@ -676,19 +676,20 @@ fn _train_policy_phase(
             adv_std_acc.accumulate(&adv.std(false));
             adv_magnitude_acc.accumulate(&adv.abs());
 
+            // Many of the papers normalize the advantages.
+            // In some small scale tests, I'm not seeing a significant advantage in our model.
+            // my guess is that it's because the rewards are bounded
+            let adv = (&adv - adv.mean(None)) / (adv.std(false) + 1e-8);
+
             let intrinsic_adv = gae_intrinsic_buffer.index_select(0, &idxs);
             intrinsic_adv_acc.accumulate(&intrinsic_adv);
             intrinsic_adv_std_acc.accumulate(&intrinsic_adv.std(false));
 
+            assert!(!intrinsic_adv.requires_grad());
             let intrinsic_adv =
                 (&intrinsic_adv - intrinsic_adv.mean(None)) / (intrinsic_adv.std(false) + 1e-8);
 
             let adv = adv + hypers::INTRINSIC_ADV_SCALING * intrinsic_adv;
-
-            // Many of the papers normalize the advantages.
-            // In some small scale tests, I'm not seeing a significant advantage in our model.
-            // my guess is that it's because the rewards are bounded
-            // let adv = (&adv - adv.mean(None)) / (adv.std(false) + 1e-8);
 
             let logp = policy.log_softmax(1, None).gather(
                 1,

@@ -415,7 +415,9 @@ pub fn record_weighted_game_length(length: f64, model_name: &str) {
 
         meter
             .f64_gauge("weighted_game_length")
-            .with_description("the exponential moving average of game lengths used for sampling frames")
+            .with_description(
+                "the exponential moving average of game lengths used for sampling frames",
+            )
             .build()
     });
 
@@ -425,21 +427,227 @@ pub fn record_weighted_game_length(length: f64, model_name: &str) {
     );
 }
 
+pub fn record_advantage_statistics(
+    adv_external_mean: f64,
+    adv_external_std: f64,
+    adv_intrinsic_mean: f64,
+    adv_intrinsic_std: f64,
+    model_name: &str,
+) {
+    static TRAINING_ADV_EXTERNAL_MEAN_TOTAL: OnceLock<Counter<f64>> = OnceLock::new();
+    static TRAINING_ADV_EXTERNAL_STD_TOTAL: OnceLock<Counter<f64>> = OnceLock::new();
+    static TRAINING_ADV_INTRINSIC_MEAN_TOTAL: OnceLock<Counter<f64>> = OnceLock::new();
+    static TRAINING_ADV_INTRINSIC_STD_TOTAL: OnceLock<Counter<f64>> = OnceLock::new();
+
+    let training_adv_external_mean_total = TRAINING_ADV_EXTERNAL_MEAN_TOTAL.get_or_init(|| {
+        let meter = opentelemetry::global::meter_with_scope(scope().clone());
+
+        meter
+            .f64_counter("training_advantage_external_mean_total")
+            .with_description("a counter for the sum of external advantage means")
+            .build()
+    });
+
+    let training_adv_external_std_total = TRAINING_ADV_EXTERNAL_STD_TOTAL.get_or_init(|| {
+        let meter = opentelemetry::global::meter_with_scope(scope().clone());
+
+        meter
+            .f64_counter("training_advantage_external_std_total")
+            .with_description("a counter for the sum of external advantage standard deviations")
+            .build()
+    });
+
+    let training_adv_intrinsic_mean_total = TRAINING_ADV_INTRINSIC_MEAN_TOTAL.get_or_init(|| {
+        let meter = opentelemetry::global::meter_with_scope(scope().clone());
+
+        meter
+            .f64_counter("training_advantage_intrinsic_mean_total")
+            .with_description("a counter for the sum of intrinsic advantage means")
+            .build()
+    });
+
+    let training_adv_intrinsic_std_total = TRAINING_ADV_INTRINSIC_STD_TOTAL.get_or_init(|| {
+        let meter = opentelemetry::global::meter_with_scope(scope().clone());
+
+        meter
+            .f64_counter("training_advantage_intrinsic_std_total")
+            .with_description("a counter for the sum of intrinsic advantage standard deviations")
+            .build()
+    });
+
+    training_adv_external_mean_total.add(
+        adv_external_mean,
+        &[KeyValue::new("model_name", model_name.to_string())],
+    );
+    training_adv_external_std_total.add(
+        adv_external_std,
+        &[KeyValue::new("model_name", model_name.to_string())],
+    );
+    training_adv_intrinsic_mean_total.add(
+        adv_intrinsic_mean,
+        &[KeyValue::new("model_name", model_name.to_string())],
+    );
+    training_adv_intrinsic_std_total.add(
+        adv_intrinsic_std,
+        &[KeyValue::new("model_name", model_name.to_string())],
+    );
+}
+
+/// Things that have negative values can't be counters so they show up here and get updated per epoch.
+pub fn record_mean_statistics(
+    mean_value: f64,
+    mean_intrinsic_value: f64,
+    mean_intrinsic_value_std: f64,
+    mean_adv: f64,
+    mean_adv_std: f64,
+    mean_intrinsic_adv: f64,
+    mean_intrinsic_adv_std: f64,
+    mean_adv_magnitude_acc: f64,
+    mean_policy_loss: f64,
+    model_name: &str,
+) {
+    static MEAN_VALUE_TOTAL: OnceLock<Gauge<f64>> = OnceLock::new();
+    static MEAN_INTRINSIC_VALUE_TOTAL: OnceLock<Gauge<f64>> = OnceLock::new();
+    static MEAN_INTRINSIC_VALUE_STD: OnceLock<Gauge<f64>> = OnceLock::new();
+    static MEAN_POLICY_LOSS: OnceLock<Gauge<f64>> = OnceLock::new();
+    static MEAN_ADV: OnceLock<Gauge<f64>> = OnceLock::new();
+    static MEAN_ADV_STD: OnceLock<Gauge<f64>> = OnceLock::new();
+    static MEAN_INTRINSIC_ADV: OnceLock<Gauge<f64>> = OnceLock::new();
+    static MEAN_INTRINSIC_ADV_STD: OnceLock<Gauge<f64>> = OnceLock::new();
+    static MEAN_ADV_MAGNITUDE_ACC: OnceLock<Gauge<f64>> = OnceLock::new();
+
+    let mean_policy_loss_gauge = MEAN_POLICY_LOSS.get_or_init(|| {
+        let meter = opentelemetry::global::meter_with_scope(scope().clone());
+
+        meter
+            .f64_gauge("training_mean_policy_loss")
+            .with_description("the mean policy loss during training")
+            .build()
+    });
+
+    let mean_value_total = MEAN_VALUE_TOTAL.get_or_init(|| {
+        let meter = opentelemetry::global::meter_with_scope(scope().clone());
+
+        meter
+            .f64_gauge("training_mean_value")
+            .with_description("a counter for the sum of mean values")
+            .build()
+    });
+
+    let mean_intrinsic_value_total = MEAN_INTRINSIC_VALUE_TOTAL.get_or_init(|| {
+        let meter = opentelemetry::global::meter_with_scope(scope().clone());
+
+        meter
+            .f64_gauge("training_mean_intrinsic_value")
+            .with_description("a counter for the sum of mean intrinsic values")
+            .build()
+    });
+
+    let mean_intrinsic_value_std_gauge = MEAN_INTRINSIC_VALUE_STD.get_or_init(|| {
+        let meter = opentelemetry::global::meter_with_scope(scope().clone());
+
+        meter
+            .f64_gauge("training_mean_intrinsic_value_std")
+            .with_description("standard deviation of the mean intrinsic values")
+            .build()
+    });
+
+    let mean_adv_gauge = MEAN_ADV.get_or_init(|| {
+        let meter = opentelemetry::global::meter_with_scope(scope().clone());
+
+        meter
+            .f64_gauge("training_mean_advantage")
+            .with_description("the mean advantage during training")
+            .build()
+    });
+
+    let mean_adv_std_gauge = MEAN_ADV_STD.get_or_init(|| {
+        let meter = opentelemetry::global::meter_with_scope(scope().clone());
+
+        meter
+            .f64_gauge("training_mean_advantage_std")
+            .with_description("standard deviation of the mean advantage during training")
+            .build()
+    });
+
+    let mean_intrinsic_adv_gauge = MEAN_INTRINSIC_ADV.get_or_init(|| {
+        let meter = opentelemetry::global::meter_with_scope(scope().clone());
+
+        meter
+            .f64_gauge("training_mean_intrinsic_advantage")
+            .with_description("the mean intrinsic advantage during training")
+            .build()
+    });
+
+    let mean_intrinsic_adv_std_gauge = MEAN_INTRINSIC_ADV_STD.get_or_init(|| {
+        let meter = opentelemetry::global::meter_with_scope(scope().clone());
+
+        meter
+            .f64_gauge("training_mean_intrinsic_advantage_std")
+            .with_description("standard deviation of the mean intrinsic advantage during training")
+            .build()
+    });
+
+    let mean_adv_magnitude_acc_gauge = MEAN_ADV_MAGNITUDE_ACC.get_or_init(|| {
+        let meter = opentelemetry::global::meter_with_scope(scope().clone());
+
+        meter
+            .f64_gauge("training_mean_advantage_magnitude")
+            .with_description("the mean accumulated magnitude of advantage during training")
+            .build()
+    });
+
+    mean_value_total.record(
+        mean_value,
+        &[KeyValue::new("model_name", model_name.to_string())],
+    );
+    mean_intrinsic_value_total.record(
+        mean_intrinsic_value,
+        &[KeyValue::new("model_name", model_name.to_string())],
+    );
+    mean_intrinsic_value_std_gauge.record(
+        mean_intrinsic_value_std,
+        &[KeyValue::new("model_name", model_name.to_string())],
+    );
+    mean_policy_loss_gauge.record(
+        mean_policy_loss,
+        &[KeyValue::new("model_name", model_name.to_string())],
+    );
+    mean_adv_gauge.record(
+        mean_adv,
+        &[KeyValue::new("model_name", model_name.to_string())],
+    );
+    mean_adv_std_gauge.record(
+        mean_adv_std,
+        &[KeyValue::new("model_name", model_name.to_string())],
+    );
+    mean_intrinsic_adv_gauge.record(
+        mean_intrinsic_adv,
+        &[KeyValue::new("model_name", model_name.to_string())],
+    );
+    mean_intrinsic_adv_std_gauge.record(
+        mean_intrinsic_adv_std,
+        &[KeyValue::new("model_name", model_name.to_string())],
+    );
+    mean_adv_magnitude_acc_gauge.record(
+        mean_adv_magnitude_acc,
+        &[KeyValue::new("model_name", model_name.to_string())],
+    );
+}
+
 pub fn record_policy_minibatch_statistics(
     value_loss: f64,
-    policy_loss: f64,
     entropy_loss: f64,
-    pi_ratio: f64,
-    pi_adv: f64,
+    novelty_loss: f64,
     approximate_kl: f64,
+    intrinsic_value_loss: f64,
     model_name: &str,
 ) {
     static TRAINING_ITERATIONS_COUNT_TOTAL: OnceLock<Counter<u64>> = OnceLock::new();
     static TRAINING_VALUE_LOSS_TOTAL: OnceLock<Counter<f64>> = OnceLock::new();
-    static TRAINING_POLICY_LOSS_TOTAL: OnceLock<Counter<f64>> = OnceLock::new();
     static TRAINING_ENTROPY_LOSS_TOTAL: OnceLock<Counter<f64>> = OnceLock::new();
-    static TRAINING_PI_RATIO_TOTAL: OnceLock<Counter<f64>> = OnceLock::new();
-    static TRAINING_PI_ADV_TOTAL: OnceLock<Counter<f64>> = OnceLock::new();
+    static TRAINING_NOVELTY_LOSS_TOTAL: OnceLock<Counter<f64>> = OnceLock::new();
+    static TRAINING_INTRINSIC_VALUE_LOSS_TOTAL: OnceLock<Counter<f64>> = OnceLock::new();
     static TRAINING_APPROXIMATE_KL_GAUGE: OnceLock<Gauge<f64>> = OnceLock::new();
 
     let training_iterations_count_total = TRAINING_ITERATIONS_COUNT_TOTAL.get_or_init(|| {
@@ -460,15 +668,6 @@ pub fn record_policy_minibatch_statistics(
             .build()
     });
 
-    let training_policy_loss_total = TRAINING_POLICY_LOSS_TOTAL.get_or_init(|| {
-        let meter = opentelemetry::global::meter_with_scope(scope().clone());
-
-        meter
-            .f64_counter("training_policy_loss_total")
-            .with_description("a counter for the total policy loss during training.")
-            .build()
-    });
-
     let training_entropy_loss_total = TRAINING_ENTROPY_LOSS_TOTAL.get_or_init(|| {
         let meter = opentelemetry::global::meter_with_scope(scope().clone());
 
@@ -478,23 +677,24 @@ pub fn record_policy_minibatch_statistics(
             .build()
     });
 
-    let training_pi_ratio_total = TRAINING_PI_RATIO_TOTAL.get_or_init(|| {
+    let training_novelty_loss_total = TRAINING_NOVELTY_LOSS_TOTAL.get_or_init(|| {
         let meter = opentelemetry::global::meter_with_scope(scope().clone());
 
         meter
-            .f64_counter("training_pi_ratio_total")
-            .with_description("a counter for the total ratio between new and old policy.")
+            .f64_counter("training_novelty_loss_total")
+            .with_description("a counter for the total novelty loss during training.")
             .build()
     });
 
-    let training_pi_adv_total = TRAINING_PI_ADV_TOTAL.get_or_init(|| {
-        let meter = opentelemetry::global::meter_with_scope(scope().clone());
+    let training_intrinsic_value_loss_total =
+        TRAINING_INTRINSIC_VALUE_LOSS_TOTAL.get_or_init(|| {
+            let meter = opentelemetry::global::meter_with_scope(scope().clone());
 
-        meter
-            .f64_counter("training_pi_adv_total")
-            .with_description("a counter for the total advantage.")
-            .build()
-    });
+            meter
+                .f64_counter("training_intrinsic_value_loss_total")
+                .with_description("a counter for the total intrinsic value loss during training.")
+                .build()
+        });
 
     let training_approximate_kl_gauge = TRAINING_APPROXIMATE_KL_GAUGE.get_or_init(|| {
         let meter = opentelemetry::global::meter_with_scope(scope().clone());
@@ -510,24 +710,20 @@ pub fn record_policy_minibatch_statistics(
         value_loss,
         &[KeyValue::new("model_name", model_name.to_string())],
     );
-    training_policy_loss_total.add(
-        policy_loss,
-        &[KeyValue::new("model_name", model_name.to_string())],
-    );
     training_entropy_loss_total.add(
         entropy_loss,
         &[KeyValue::new("model_name", model_name.to_string())],
     );
+    training_novelty_loss_total.add(
+        novelty_loss,
+        &[KeyValue::new("model_name", model_name.to_string())],
+    );
+    training_intrinsic_value_loss_total.add(
+        intrinsic_value_loss,
+        &[KeyValue::new("model_name", model_name.to_string())],
+    );
     training_approximate_kl_gauge.record(
         approximate_kl,
-        &[KeyValue::new("model_name", model_name.to_string())],
-    );
-    training_pi_ratio_total.add(
-        pi_ratio,
-        &[KeyValue::new("model_name", model_name.to_string())],
-    );
-    training_pi_adv_total.add(
-        pi_adv,
         &[KeyValue::new("model_name", model_name.to_string())],
     );
 }

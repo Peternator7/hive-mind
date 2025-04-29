@@ -1,8 +1,12 @@
+use std::sync::atomic::AtomicUsize;
+
 use hive_engine::piece::Color;
 use rand::{rngs::SmallRng, SeedableRng};
 use tch::Tensor;
 
 use crate::hypers;
+
+static GAMECOUNT: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Debug)]
 pub struct MultipleGames {
@@ -16,7 +20,10 @@ pub struct MultipleGames {
     /// A tensor that represents the rewards we got from making this decision.
     /// Not time discounted.
     pub gae: Vec<Tensor>,
+    pub gae_intrinsic: Vec<Tensor>,
+
     pub target_value: Vec<Tensor>,
+    pub intrinsic_value: Vec<Tensor>,
     rng: SmallRng,
 }
 
@@ -26,7 +33,9 @@ struct Frame {
     selected_policy: Tensor,
     invalid_move_mask: Tensor,
     gae: Tensor,
+    gae_intrinsic: Tensor,
     target_value: Tensor,
+    intrinsic_value: Tensor,
 }
 
 impl Default for MultipleGames {
@@ -36,7 +45,9 @@ impl Default for MultipleGames {
             selected_policy: Default::default(),
             invalid_move_mask: Default::default(),
             gae: Default::default(),
+            gae_intrinsic: Default::default(),
             target_value: Default::default(),
+            intrinsic_value: Default::default(),
             rng: rand::rngs::SmallRng::from_seed(Default::default()),
         }
     }
@@ -48,6 +59,8 @@ impl MultipleGames {
         self.selected_policy.clear();
         self.invalid_move_mask.clear();
         self.gae.clear();
+        self.gae_intrinsic.clear();
+        self.intrinsic_value.clear();
         self.target_value.clear();
     }
 
@@ -57,10 +70,12 @@ impl MultipleGames {
 
     pub fn validate_buffers(&self) -> bool {
         let len = self.game_state.len();
-        len == self.selected_policy.len()
-            && len == self.invalid_move_mask.len()
-            && len == self.gae.len()
-            && len == self.target_value.len()
+        assert_eq!(len, self.selected_policy.len());
+        assert_eq!(len, self.invalid_move_mask.len());
+        assert_eq!(len, self.gae.len());
+        assert_eq!(len, self.target_value.len());
+        assert_eq!(len, self.gae_intrinsic.len());
+        true
     }
 
     pub fn ingest_multiple_games(&mut self, other: &mut MultipleGames, step_by: usize) {
@@ -73,6 +88,8 @@ impl MultipleGames {
         self.gae.extend(other.gae.drain(..).step_by(step_by));
         self.target_value
             .extend(other.target_value.drain(..).step_by(step_by));
+
+        other.clear();
     }
 
     pub fn ingest_game(
@@ -93,50 +110,94 @@ impl MultipleGames {
             gamma = 1.0 - (1.0 / other.len() as f64);
         }
 
-        let gl = gamma * lambda;
-        let mut value = std::mem::take(&mut other.value);
+        let intrinsic_gamma = 0.95 * gamma;
+        let intrinsic_gl = lambda * intrinsic_gamma;
 
-        let mut gae_values = Vec::with_capacity(value.len());
-        let mut td_error = Vec::with_capacity(value.len());
+        // The novelty frames are one off from the rest of the values because they lag
+        // by a turn.
+
+        let gl = gamma * lambda;
+        let mut values_external = std::mem::take(&mut other.value);
+        let mut values_intrinsic = std::mem::take(&mut other.intrinsic_value);
+
+        let mut adv_intrinsic = Vec::with_capacity(values_external.len());
+        let mut adv_external = Vec::with_capacity(values_external.len());
+        let mut td_error = Vec::with_capacity(values_external.len());
 
         // This is the rewards for the final step.
-        let mut gae = match winner {
+        let outcome_rewards = match winner {
             None if stalled => Tensor::from(hypers::PENALTY_FOR_TIMING_OUT),
             None => Tensor::from(0.0f32),
             Some(winner_color) if winner_color == playing => Tensor::from(1.0f32),
             Some(..) => Tensor::from(-1.0f32),
         };
 
-        let mut discounted_rewards = gae.copy();
+        let mut gae_external = outcome_rewards.copy();
+        let mut gae_intrinsic = Tensor::from(0.0);
 
-        for idx in (0..value.len()).rev() {
-            if idx == value.len() - 1 {
-                gae = gae - &value[idx];
-                gae_values.push(gae.copy());
-                td_error.push(f64::try_from((&discounted_rewards - &value[idx]).square()).unwrap());
+        let mut td_value_external = outcome_rewards.copy();
+        let mut td_value_intrinsic = Tensor::from(0.0).unsqueeze(0);
+
+        for idx in (0..values_external.len()).rev() {
+            if idx == values_external.len() - 1 {
+                gae_external = gae_external - &values_external[idx];
+                gae_intrinsic = other.novelty.last().unwrap() - values_intrinsic[idx].copy();
+                adv_external.push(gae_external.copy());
+                adv_intrinsic.push(gae_intrinsic.copy());
+
+                td_error.push(
+                    f64::try_from((&td_value_external - &values_external[idx]).square()).unwrap(),
+                );
+
                 continue;
             }
 
-            let curr_step_rewards = -hypers::PENALTY_FOR_MOVING;
-            let delta = gamma * &value[idx + 1] + curr_step_rewards - &value[idx];
-            value[idx + 1] = discounted_rewards.copy();
-            discounted_rewards = curr_step_rewards + discounted_rewards * gamma;
+            // Calculate the intrinsic rewards.
+            let rewards_intrinsic = other.novelty[idx].copy();
+            let delta = intrinsic_gamma * &values_intrinsic[idx + 1] + &rewards_intrinsic
+                - &values_intrinsic[idx];
 
-            gae = (delta + gl * &gae).clamp(-1.0, 1.0);
-            gae_values.push(gae.copy());
-            td_error.push(f64::try_from((&discounted_rewards - &value[idx]).square()).unwrap());
+            gae_intrinsic = delta + intrinsic_gl * &gae_intrinsic;
+            adv_intrinsic.push(gae_intrinsic.copy());
+
+            values_intrinsic[idx + 1] = td_value_intrinsic.copy();
+            td_value_intrinsic = rewards_intrinsic + td_value_intrinsic * intrinsic_gamma;
+
+            // Calculate the external rewards.
+            let curr_step_rewards = -hypers::PENALTY_FOR_MOVING;
+            let delta =
+                gamma * &values_external[idx + 1] + curr_step_rewards - &values_external[idx];
+
+            gae_external = (delta + gl * &gae_external).clamp(-1.0, 1.0);
+            adv_external.push(gae_external.copy());
+
+            values_external[idx + 1] = td_value_external.copy();
+            td_value_external = curr_step_rewards + td_value_external * gamma;
+
+            td_error.push(
+                f64::try_from((&td_value_external - &values_external[idx]).square()).unwrap(),
+            );
         }
 
-        value[0] = discounted_rewards;
+        values_external[0] = td_value_external;
+        values_intrinsic[0] = td_value_intrinsic;
 
-        gae_values.reverse();
+        adv_external.reverse();
+        adv_intrinsic.reverse();
         td_error.reverse();
+
+        let x = GAMECOUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if x % 1000 < 1 {
+            // dbg!(x, &values_intrinsic, &adv_intrinsic);
+        }
 
         let game_state = other.game_state.drain(..);
         let mut selected_policy = other.selected_policy.drain(..);
         let mut invalid_move_mask = other.invalid_move_mask.drain(..);
-        let mut value = value.into_iter();
-        let mut gae_values = gae_values.into_iter();
+        let mut value_external = values_external.into_iter();
+        let mut adv_external = adv_external.into_iter();
+        let mut adv_intrinsic = adv_intrinsic.into_iter();
+        let mut value_intrinsic = values_intrinsic.into_iter();
         let mut td_error = td_error.into_iter();
 
         let mut row_major_frames = Vec::new();
@@ -145,8 +206,10 @@ impl MultipleGames {
                 game_state,
                 selected_policy: selected_policy.next().unwrap(),
                 invalid_move_mask: invalid_move_mask.next().unwrap(),
-                target_value: value.next().unwrap(),
-                gae: gae_values.next().unwrap(),
+                target_value: value_external.next().unwrap(),
+                intrinsic_value: value_intrinsic.next().unwrap(),
+                gae: adv_external.next().unwrap(),
+                gae_intrinsic: adv_intrinsic.next().unwrap(),
                 td_error: td_error.next().unwrap(),
             }))
         }
@@ -158,14 +221,24 @@ impl MultipleGames {
             row_major_frames.len().min(max_frames_per_game),
         )
         .unwrap();
+
         for idx in indices {
             let frame = row_major_frames[idx].take().unwrap();
             self.game_state.push(frame.game_state);
             self.selected_policy.push(frame.selected_policy);
             self.invalid_move_mask.push(frame.invalid_move_mask);
+
             self.gae.push(frame.gae);
+
+            self.gae_intrinsic.push(frame.gae_intrinsic);
+
             self.target_value.push(frame.target_value);
+            self.intrinsic_value.push(frame.intrinsic_value);
         }
+
+        drop(selected_policy);
+        drop(invalid_move_mask);
+        other.clear();
 
         // let mut samples_to_skip = 0;
         // if value.len() > 2 * max_frames_per_game {
@@ -192,8 +265,6 @@ impl MultipleGames {
         // self.gae
         //     .extend(gae_values.into_iter().skip(samples_to_skip).step_by(2));
 
-        other.playing.take();
-
         assert!(self.validate_buffers());
     }
 }
@@ -210,6 +281,10 @@ pub struct SingleGame {
     pub invalid_move_mask: Vec<Tensor>,
 
     pub value: Vec<Tensor>,
+
+    pub intrinsic_value: Vec<Tensor>,
+
+    pub novelty: Vec<Tensor>,
 }
 
 impl SingleGame {
@@ -219,6 +294,8 @@ impl SingleGame {
         self.selected_policy.clear();
         self.invalid_move_mask.clear();
         self.value.clear();
+        self.intrinsic_value.clear();
+        self.novelty.clear();
     }
 
     pub fn len(&self) -> usize {
@@ -227,8 +304,11 @@ impl SingleGame {
 
     pub fn validate_buffers(&self) -> bool {
         let len = self.game_state.len();
-        len == self.selected_policy.len()
-            && len == self.invalid_move_mask.len()
-            && len == self.value.len()
+        assert_eq!(len, self.selected_policy.len());
+        assert_eq!(len, self.invalid_move_mask.len());
+        assert_eq!(len, self.value.len());
+        assert_eq!(len, self.intrinsic_value.len());
+        assert_eq!(len, self.novelty.len());
+        true
     }
 }

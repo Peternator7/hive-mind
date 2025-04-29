@@ -6,11 +6,13 @@ use std::time::Instant;
 use hive_engine::error::HiveError;
 use hive_engine::game::GameWinner;
 use hive_engine::movement::Move;
-use hive_engine::piece::{Insect, Piece};
+use hive_engine::piece::{ColorMap, Insect, Piece};
 use hive_engine::position::Position;
 use hive_engine::{game::Game, piece::Color};
+use hive_ml::acc::Accumulator;
 use hive_ml::encode::{translate_game_to_conv_tensor, translate_to_valid_moves_mask};
 use hive_ml::metrics;
+use hive_ml::model::Prediction;
 use hive_ml::{
     frames::{MultipleGames, SingleGame},
     hypers::{self},
@@ -488,6 +490,8 @@ fn play_game_to_end<'a>(
         position: Position(16, 16),
     })?;
 
+    let mut is_first_move = ColorMap::new(true, true);
+
     loop {
         let (player, opponent) = if g.to_play() == Color::White {
             (&mut *white_player, &mut *black_player)
@@ -496,7 +500,7 @@ fn play_game_to_end<'a>(
         };
 
         if g.turn() == hypers::MAX_TURNS_PER_GAME {
-            return Err(HiveError::TurnLimitHit);
+            break;
         }
 
         let device = player.model.device;
@@ -537,7 +541,13 @@ fn play_game_to_end<'a>(
         let map = translate_to_valid_moves_mask(&g, &valid_moves, playing, &mut invalid_moves_mask);
         let invalid_moves_tensor = Tensor::from_slice(&invalid_moves_mask);
 
-        let (value, mut policy) = tch::no_grad(|| player.model.value_policy(&curr_state_batch));
+        let Prediction {
+            value,
+            mut policy,
+            intrinsic_value,
+        } = tch::no_grad(|| player.model.predict(&curr_state_batch));
+
+        let novelty = tch::no_grad(|| player.model.novelty(&curr_state_batch));
 
         let _ = policy.masked_fill_(&invalid_moves_tensor.to(device), f64::NEG_INFINITY);
 
@@ -552,12 +562,53 @@ fn play_game_to_end<'a>(
             .samples
             .value
             .push(value.view(1i64).to(tch::Device::Cpu));
+
         player
             .samples
             .selected_policy
             .push(sampled_action_idx.view(1i64).to(tch::Device::Cpu));
 
+        player
+            .samples
+            .intrinsic_value
+            .push(intrinsic_value.view(1i64).to(tch::Device::Cpu));
+
+        // if (g.turn() > 1 && playing == Color::White) || (g.turn() > 0 && playing == Color::Black) {
+        let is_first_move = is_first_move.get_mut(playing);
+        if *is_first_move {
+            *is_first_move = false;
+        } else {
+            player
+                .samples
+                .novelty
+                .push(novelty.view(1i64).to(tch::Device::Cpu));
+        }
+
         metrics::increment_move_made(*mv, playing, player.name, opponent.name);
+    }
+
+    // Calculate the novely of the final board state for reach player.
+    for player in [Color::White, Color::Black] {
+        let player_data = if player == Color::White {
+            &mut *white_player
+        } else {
+            &mut *black_player
+        };
+
+        let gw = translate_game_to_conv_tensor(&g, player);
+        let gw_batch = gw.unsqueeze(0).to(player_data.model.device);
+        let final_novelty = player_data
+            .model
+            .novelty(&gw_batch)
+            .view(1)
+            .to(tch::Device::Cpu);
+
+        player_data.samples.novelty.push(final_novelty);
+        assert!(player_data.samples.validate_buffers());
+    }
+
+    if g.turn() == hypers::MAX_TURNS_PER_GAME {
+        return Err(HiveError::TurnLimitHit);
     }
 
     Ok(winner)
@@ -570,11 +621,16 @@ fn _train_policy_phase(
     entropy_loss_scaling: f64,
     model_name: &str,
 ) -> usize {
+    frames.validate_buffers();
+
     let state_buffer = Tensor::stack(frames.game_state.as_slice(), 0).to(model.device);
     let mask_buffer = Tensor::stack(frames.invalid_move_mask.as_slice(), 0).to(model.device);
     let selections_buffer = Tensor::stack(frames.selected_policy.as_slice(), 0).to(model.device);
-    let gae_buffer = Tensor::stack(frames.gae.as_slice(), 0).to(model.device);
+    let gae_external_buffer = Tensor::stack(frames.gae.as_slice(), 0).to(model.device);
+    let gae_intrinsic_buffer = Tensor::stack(frames.gae_intrinsic.as_slice(), 0).to(model.device);
     let target_value_buffer = Tensor::stack(frames.target_value.as_slice(), 0).to(model.device);
+    let intrinsic_target_value_buffer =
+        Tensor::stack(frames.intrinsic_value.as_slice(), 0).to(model.device);
 
     let logp_old = tch::no_grad(|| model.policy(&state_buffer))
         .masked_fill_(&mask_buffer, f64::NEG_INFINITY)
@@ -582,14 +638,23 @@ fn _train_policy_phase(
         .gather(1, &selections_buffer, false);
 
     let mut batch_count = 0;
-    let mut total_value_loss = Tensor::zeros(1, (Kind::Float, model.device));
-    let mut total_value_count = 0;
+
+    // Things that have negative values can't be counters so we have accumulators that we use
+    // to capture the average value over the course of the training run.
+    let mut value_acc = Accumulator::default();
+    let mut intrinsic_value_acc = Accumulator::default();
+    let mut intrinsic_value_std_acc = Accumulator::default();
+    let mut adv_acc = Accumulator::default();
+    let mut adv_std_acc = Accumulator::default();
+    let mut adv_magnitude_acc = Accumulator::default();
+    let mut intrinsic_adv_acc = Accumulator::default();
+    let mut intrinsic_adv_std_acc = Accumulator::default();
+    let mut policy_acc = Accumulator::default();
 
     model.set_train_mode(true);
     for _ in 0..hypers::POLICY_PHASE_TRAIN_ITERS {
         batch_count += 1;
         let perms = Tensor::randperm(frames.len() as i64, (Kind::Int64, model.device));
-        let should_stop_early = false;
 
         for start in (0..frames.len()).step_by(hypers::BATCH_SIZE) {
             adam.zero_grad();
@@ -599,17 +664,33 @@ fn _train_policy_phase(
             let states = state_buffer.index_select(0, &idxs);
             let mask = &mask_buffer.index_select(0, &idxs);
 
-            let (values, mut policies) = model.value_policy(&states);
-            let _ = policies.masked_fill_(&mask, f64::NEG_INFINITY);
+            let Prediction {
+                value,
+                intrinsic_value,
+                mut policy,
+            } = model.predict(&states);
+            let _ = policy.masked_fill_(&mask, f64::NEG_INFINITY);
 
-            let adv = gae_buffer.index_select(0, &idxs);
+            let adv = gae_external_buffer.index_select(0, &idxs);
+            adv_acc.accumulate(&adv);
+            adv_std_acc.accumulate(&adv.std(false));
+            adv_magnitude_acc.accumulate(&adv.abs());
+
+            let intrinsic_adv = gae_intrinsic_buffer.index_select(0, &idxs);
+            intrinsic_adv_acc.accumulate(&intrinsic_adv);
+            intrinsic_adv_std_acc.accumulate(&intrinsic_adv.std(false));
+
+            let intrinsic_adv =
+                (&intrinsic_adv - intrinsic_adv.mean(None)) / (intrinsic_adv.std(false) + 1e-8);
+
+            let adv = adv + hypers::INTRINSIC_ADV_SCALING * intrinsic_adv;
 
             // Many of the papers normalize the advantages.
             // In some small scale tests, I'm not seeing a significant advantage in our model.
             // my guess is that it's because the rewards are bounded
             // let adv = (&adv - adv.mean(None)) / (adv.std(false) + 1e-8);
 
-            let logp = policies.log_softmax(1, None).gather(
+            let logp = policy.log_softmax(1, None).gather(
                 1,
                 &selections_buffer.index_select(0, &idxs),
                 false,
@@ -618,36 +699,40 @@ fn _train_policy_phase(
             let logp_old = logp_old.index_select(0, &idxs);
 
             let ratio = (&logp - &logp_old).exp_();
-            let ratio_f = f64::try_from(ratio.mean(None)).unwrap();
-            let adv_f = f64::try_from(adv.mean(None)).unwrap();
             let clip_adv = ratio.clamp(1.0 - hypers::EPSILON, 1.0 + hypers::EPSILON) * &adv;
 
-            let pi_loss = (ratio * adv).minimum(&clip_adv).mean(None);
+            let pi_loss = (ratio * adv).minimum(&clip_adv);
+            policy_acc.accumulate(&pi_loss);
+            let pi_loss = pi_loss.mean(None);
 
-            let value_loss = (values - target_value_buffer.index_select(0, &idxs))
+            let target_value = target_value_buffer.index_select(0, &idxs);
+            let value_loss = (&value - &target_value).square().mean(None);
+            value_acc.accumulate(&value);
+
+            let intrinsic_target_value = intrinsic_target_value_buffer.index_select(0, &idxs);
+            let intrinsic_value_loss = (&intrinsic_value - &intrinsic_target_value)
                 .square()
                 .mean(None);
+            intrinsic_value_acc.accumulate(&intrinsic_value);
+            intrinsic_value_std_acc.accumulate(&intrinsic_value.std(false));
 
-            total_value_loss = tch::no_grad(|| total_value_loss + &value_loss);
-            total_value_count += 1;
-
-            let p_prob = policies.softmax(1, None) + 0.00001;
+            let p_prob = policy.softmax(1, None) + 0.00001;
             let h = mask.logical_not() * (&p_prob * p_prob.log());
             let entropy_loss = h.sum_dim_intlist(1, false, None).neg().mean(None);
             let approx_kl: f64 = (logp_old - logp).mean(None).try_into().expect("success");
-            // Tensor::stack(&[&value_loss, &pi_loss, &entropy_loss], 0).print();
+
+            let novelty_loss = model.novelty(&states).mean(None);
 
             metrics::record_policy_minibatch_statistics(
                 f64::try_from(&value_loss).unwrap(),
-                f64::try_from(&pi_loss).unwrap(),
                 f64::try_from(&entropy_loss).unwrap(),
-                ratio_f,
-                adv_f,
+                f64::try_from(&novelty_loss).unwrap(),
                 approx_kl,
+                f64::try_from(&intrinsic_value_loss).unwrap(),
                 model_name,
             );
 
-            let loss: Tensor = value_loss
+            let loss: Tensor = value_loss + intrinsic_value_loss + novelty_loss
                 - (hypers::PI_LOSS_RATIO * pi_loss)
                 - (entropy_loss_scaling * entropy_loss);
 
@@ -655,20 +740,22 @@ fn _train_policy_phase(
             adam.clip_grad_norm(hypers::GRAD_CLIP);
             adam.step();
         }
-
-        if should_stop_early {
-            println!("Ended training after {} iters", batch_count);
-            break;
-        }
     }
 
     model.set_train_mode(false);
 
-    let mse = total_value_loss / total_value_count;
-    mse.print();
-    let mse: f64 = mse.try_into().unwrap();
-
-    metrics::record_value_mse(mse);
+    metrics::record_mean_statistics(
+        value_acc.mean(),
+        intrinsic_value_acc.mean(),
+        intrinsic_value_std_acc.mean(),
+        adv_acc.mean(),
+        adv_std_acc.mean(),
+        intrinsic_adv_acc.mean(),
+        intrinsic_adv_std_acc.mean(),
+        adv_magnitude_acc.mean(),
+        policy_acc.mean(),
+        model_name,
+    );
 
     adam.zero_grad();
 

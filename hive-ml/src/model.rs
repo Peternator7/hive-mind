@@ -9,6 +9,16 @@ pub struct HiveModel {
     residual_blocks: Vec<(tch::nn::Conv2D, tch::nn::BatchNorm)>,
     policy_layer: tch::nn::Sequential,
     value_layer: tch::nn::Sequential,
+    intrinsic_value_layer: tch::nn::Sequential,
+
+    random_target: RndModel,
+    distillation: RndModel,
+}
+
+pub struct Prediction {
+    pub value: Tensor,
+    pub intrinsic_value: Tensor,
+    pub policy: Tensor,
 }
 
 impl HiveModel {
@@ -65,11 +75,18 @@ impl HiveModel {
                 dims_after_conv,
                 1,
                 Default::default(),
-            ))
-            .add_fn(|xs| xs.tanh());
+            ));
+
+        let intrinsic_value_layer = nn::seq()
+            .add(nn::linear(
+                p / "ic" / "l1",
+                dims_after_conv,
+                1,
+                Default::default(),
+            ));
 
         let policy_layer = nn::seq().add(nn::linear(
-            p / "a" / "l2",
+            p / "a" / "l1",
             dims_after_conv,
             OUTPUT_LENGTH as i64,
             Default::default(),
@@ -78,12 +95,22 @@ impl HiveModel {
         Self {
             policy_layer,
             value_layer,
+            intrinsic_value_layer,
             conv_i,
             bn_i,
             residual_blocks,
             train_mode: false,
             device: p.device(),
+            distillation: RndModel::new(p / "rnd_student"),
+            random_target: RndModel::new(p / "rnd_target"),
         }
+    }
+
+    pub fn novelty(&self, game_state: &Tensor) -> Tensor {
+        let target = self.random_target.evaluate(game_state).detach();
+        let pred = self.distillation.evaluate(game_state);
+
+        (target - pred).abs().mean_dim(1, false, None)
     }
 
     pub fn value_policy(&self, game_state: &Tensor) -> (Tensor, Tensor) {
@@ -94,12 +121,18 @@ impl HiveModel {
         )
     }
 
+    pub fn predict(&self, game_state: &Tensor) -> Prediction {
+        let t = self.shared_layers(game_state);
+        Prediction {
+            value: t.detach().apply(&self.value_layer),
+            policy: t.apply(&self.policy_layer),
+            intrinsic_value: t.detach().apply(&self.intrinsic_value_layer),
+        }
+    }
+
     pub fn value_policy_auxiliary(&self, game_state: &Tensor) -> (Tensor, Tensor) {
         let t = self.shared_layers(game_state);
-        (
-            t.apply(&self.value_layer),
-            t.apply(&self.policy_layer),
-        )
+        (t.apply(&self.value_layer), t.apply(&self.policy_layer))
     }
 
     pub fn policy(&self, game_state: &Tensor) -> Tensor {
@@ -123,5 +156,28 @@ impl HiveModel {
 
         output = output.max_pool2d_default(2);
         output.flat_view()
+    }
+}
+
+struct RndModel {
+    layers: nn::Sequential,
+}
+
+impl RndModel {
+    pub fn new(p: nn::Path) -> Self {
+        Self {
+            layers: nn::seq()
+                .add(nn::conv2d(&p / "c1", INPUT_ENCODED_DIMS as i64, 1, 3, Default::default()))
+                .add_fn(|xs| xs.max_pool2d_default(2))
+                .add_fn(|xs| xs.flat_view())
+                .add_fn(|xs| xs.tanh())
+                .add(nn::linear(&p / "h1", 144, 16, Default::default()))
+                .add_fn(|xs| xs.tanh())
+                .add(nn::linear(&p / "o", 16, 8, Default::default())),
+        }
+    }
+
+    pub fn evaluate(&self, game_state: &Tensor) -> Tensor {
+        game_state.apply(&self.layers)
     }
 }

@@ -6,19 +6,20 @@ use std::time::Instant;
 use hive_engine::error::HiveError;
 use hive_engine::game::GameWinner;
 use hive_engine::movement::Move;
-use hive_engine::piece::{ColorMap, Insect, Piece};
+use hive_engine::piece::{Insect, Piece};
 use hive_engine::position::Position;
 use hive_engine::{game::Game, piece::Color};
 use hive_ml::acc::Accumulator;
-use hive_ml::encode::{translate_game_to_conv_tensor, translate_to_valid_moves_mask};
-use hive_ml::metrics;
 use hive_ml::model::Prediction;
+use hive_ml::seen::SeenPositions;
 use hive_ml::{
     frames::{MultipleGames, SingleGame},
     hypers::{self},
     model::HiveModel,
 };
+use hive_ml::{metrics, Agent, BlendedAgent, HiveModelAgent, RandomAgent};
 use rand::seq::{IndexedRandom, SliceRandom};
+use rand::Rng;
 use tch::nn::{Optimizer, OptimizerConfig, VarStore};
 use tch::{nn, IndexOp, Kind, Tensor};
 
@@ -29,15 +30,10 @@ struct ModelData {
     name: String,
     vs: VarStore,
     frames: Mutex<MultipleGames>,
+    seen: Mutex<SeenPositions>,
     rolling_length: Mutex<f64>,
     auxiliary_frames: Mutex<MultipleGames>,
     model: Mutex<HiveModel>,
-}
-
-struct PlayerGameData<'a> {
-    name: &'a str,
-    model: &'a HiveModel,
-    samples: &'a mut SingleGame,
 }
 
 impl ModelData {
@@ -57,6 +53,7 @@ impl ModelData {
             name: name.to_string(),
             vs,
             frames: Default::default(),
+            seen: Mutex::new(SeenPositions::new(4)),
             auxiliary_frames: Default::default(),
             rolling_length: Mutex::new(hypers::MAX_FRAMES_PER_GAME as f64),
             model,
@@ -75,8 +72,6 @@ pub fn main() -> Result<(), Box<dyn Error>> {
     let provider = metrics::init_meter_provider();
     metrics::record_training_start_time();
     metrics::record_training_status(true);
-
-    let random_model = ModelData::new("random_model", device, None)?;
 
     // Create four models to train in parallel
     let mut models = Vec::new();
@@ -127,6 +122,7 @@ pub fn main() -> Result<(), Box<dyn Error>> {
                                 opponents.push(opponent);
                             }
 
+                            let mut random_agent = RandomAgent::new();
                             let mut rng = rand::rng();
                             let samples = &mut SingleGame::default();
                             let opponent_samples = &mut SingleGame::default();
@@ -139,39 +135,58 @@ pub fn main() -> Result<(), Box<dyn Error>> {
 
                                 // The rest of the game playing code remains the same
                                 let model_plays_as = *play_as.choose(&mut rng).unwrap();
-                                let mut white_model;
-                                let mut black_model;
+                                let white_model: &mut dyn Agent;
+                                let black_model: &mut dyn Agent;
 
                                 let opponent_idx = *indices.choose(&mut rng).unwrap();
-                                let opponent = &opponents[opponent_idx];
+                                let opponent_model = &opponents[opponent_idx];
                                 let opponent_name = &*models[opponent_idx].name;
+                                let mut should_sample_opponent_play = true;
 
                                 samples.playing = Some(model_plays_as);
                                 opponent_samples.playing = Some(model_plays_as.opposing());
-                                if model_plays_as == Color::White {
-                                    white_model = PlayerGameData {
-                                        name: model_data.name.as_str(),
-                                        samples: samples,
-                                        model: thread_model,
-                                    };
+                                let mut model = BlendedAgent::new(
+                                    &model_data.name,
+                                    HiveModelAgent::new(
+                                        &model_data.name,
+                                        thread_model,
+                                        samples,
+                                        Some(&model_data.seen),
+                                        true,
+                                    ),
+                                    RandomAgent::new(),
+                                    0.033,
+                                );
 
-                                    black_model = PlayerGameData {
-                                        name: opponent_name,
-                                        samples: opponent_samples,
-                                        model: opponent,
-                                    };
+                                let opponent: &mut dyn Agent;
+                                let mut blended_opponent: BlendedAgent<_, _>;
+
+                                if rng.random_bool(hypers::TRAINING_PLAY_VS_RANDOM_PCT) {
+                                    opponent = &mut random_agent;
+                                    should_sample_opponent_play = false;
                                 } else {
-                                    black_model = PlayerGameData {
-                                        name: model_data.name.as_str(),
-                                        samples: samples,
-                                        model: thread_model,
-                                    };
+                                    blended_opponent = BlendedAgent::new(
+                                        opponent_name,
+                                        HiveModelAgent::new(
+                                            opponent_name,
+                                            opponent_model,
+                                            opponent_samples,
+                                            Some(&models[opponent_idx].seen),
+                                            true,
+                                        ),
+                                        &mut random_agent,
+                                        hypers::TRAINING_PLAY_RANDOM_MOVE_FREQUENCY,
+                                    );
 
-                                    white_model = PlayerGameData {
-                                        name: opponent_name,
-                                        samples: opponent_samples,
-                                        model: opponent,
-                                    };
+                                    opponent = &mut blended_opponent;
+                                }
+
+                                if model_plays_as == Color::White {
+                                    white_model = &mut model;
+                                    black_model = opponent;
+                                } else {
+                                    white_model = opponent;
+                                    black_model = &mut model;
                                 };
 
                                 let mut game = Game::new();
@@ -179,25 +194,22 @@ pub fn main() -> Result<(), Box<dyn Error>> {
                                 games_played.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
                                 let mut stalled = false;
-                                let winner = match play_game_to_end(
-                                    &mut game,
-                                    &mut white_model,
-                                    &mut black_model,
-                                ) {
-                                    Ok(winner) => winner,
-                                    Err(HiveError::TurnLimitHit) => {
-                                        stalled = true;
-                                        None
-                                    }
-                                    Err(e) => return Err(e),
-                                };
+                                let winner =
+                                    match play_game_to_end(&mut game, white_model, black_model) {
+                                        Ok(winner) => winner,
+                                        Err(HiveError::TurnLimitHit) => {
+                                            stalled = true;
+                                            None
+                                        }
+                                        Err(e) => return Err(e),
+                                    };
 
                                 let elapsed = Instant::now() - game_start_time;
                                 metrics::record_game_duration(
                                     elapsed.as_secs_f64(),
                                     model_plays_as,
                                     &model_data.name,
-                                    opponent_name,
+                                    opponent.name(),
                                 );
 
                                 metrics::increment_games_finished(
@@ -205,7 +217,7 @@ pub fn main() -> Result<(), Box<dyn Error>> {
                                     winner,
                                     stalled,
                                     &model_data.name,
-                                    opponent_name,
+                                    opponent.name(),
                                 );
 
                                 games_finished.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -214,7 +226,7 @@ pub fn main() -> Result<(), Box<dyn Error>> {
                                     game.turn(),
                                     model_plays_as,
                                     &model_data.name,
-                                    opponent_name,
+                                    opponent.name(),
                                 );
 
                                 games_lengths.lock().unwrap().push(game.turn() as f32);
@@ -223,10 +235,11 @@ pub fn main() -> Result<(), Box<dyn Error>> {
                                 *rolling_length *= 0.999;
                                 *rolling_length += 0.001 * (game.turn() as f64);
 
-                                let target_frames = rolling_length.clamp(
-                                    hypers::MIN_FRAMES_PER_GAME as f64,
-                                    hypers::MAX_FRAMES_PER_GAME as f64,
-                                ) as usize;
+                                let target_frames =
+                                    (hypers::TARGET_FRAME_PERCENTAGE * *rolling_length).clamp(
+                                        hypers::MIN_FRAMES_PER_GAME as f64,
+                                        hypers::MAX_FRAMES_PER_GAME as f64,
+                                    ) as usize;
 
                                 metrics::record_weighted_game_length(
                                     *rolling_length,
@@ -248,35 +261,41 @@ pub fn main() -> Result<(), Box<dyn Error>> {
                                 metrics::record_frame_buffer_count(frames.len());
                                 drop(frames);
 
-                                let mut frames = models[opponent_idx].frames.lock().unwrap();
-                                if frames.len() < hypers::TARGET_FRAMES_PER_BATCH {
-                                    let mut rolling_length =
-                                        models[opponent_idx].rolling_length.lock().unwrap();
+                                // If we injected more randomness into the opponent, then we shouldn't record their frames
+                                // because they're not meaningful.
+                                if should_sample_opponent_play {
+                                    let mut frames = models[opponent_idx].frames.lock().unwrap();
+                                    if frames.len() < hypers::TARGET_FRAMES_PER_BATCH {
+                                        let mut rolling_length =
+                                            models[opponent_idx].rolling_length.lock().unwrap();
 
-                                    *rolling_length *= 0.999;
-                                    *rolling_length += 0.001 * (game.turn() as f64);
+                                        *rolling_length *= 0.999;
+                                        *rolling_length += 0.001 * (game.turn() as f64);
 
-                                    let target_frames = rolling_length.clamp(
-                                        hypers::MIN_FRAMES_PER_GAME as f64,
-                                        hypers::MAX_FRAMES_PER_GAME as f64,
-                                    )
-                                        as usize;
+                                        let target_frames = (hypers::TARGET_FRAME_PERCENTAGE
+                                            * *rolling_length)
+                                            .clamp(
+                                                hypers::MIN_FRAMES_PER_GAME as f64,
+                                                hypers::MAX_FRAMES_PER_GAME as f64,
+                                            )
+                                            as usize;
 
-                                    metrics::record_weighted_game_length(
-                                        *rolling_length,
-                                        &models[opponent_idx].name,
-                                    );
+                                        metrics::record_weighted_game_length(
+                                            *rolling_length,
+                                            &models[opponent_idx].name,
+                                        );
 
-                                    drop(rolling_length); // Release the lock here.
+                                        drop(rolling_length); // Release the lock here.
 
-                                    frames.ingest_game(
-                                        opponent_samples,
-                                        winner,
-                                        stalled,
-                                        hypers::GAMMA,
-                                        hypers::LAMBDA,
-                                        target_frames,
-                                    );
+                                        frames.ingest_game(
+                                            opponent_samples,
+                                            winner,
+                                            stalled,
+                                            hypers::GAMMA,
+                                            hypers::LAMBDA,
+                                            target_frames,
+                                        );
+                                    }
                                 }
                             }
 
@@ -320,6 +339,7 @@ pub fn main() -> Result<(), Box<dyn Error>> {
         let st = Instant::now();
 
         for model_data in models.iter_mut() {
+            model_data.seen.lock().unwrap().advance_generation();
             let mut adam = nn::Adam::default().build(&model_data.vs, lr).unwrap();
             let frames = &mut *model_data.frames.lock().unwrap();
             metrics::record_learning_rate(lr);
@@ -383,9 +403,15 @@ pub fn main() -> Result<(), Box<dyn Error>> {
                                 let thread_model = &HiveModel::new(&thread_vs.root());
                                 thread_vs.copy(&model_data.vs).unwrap();
 
-                                let mut old_vs = VarStore::new(device);
-                                let old_model = HiveModel::new(&old_vs.root());
-                                old_vs.copy(&random_model.vs).unwrap();
+                                let mut random_agent = RandomAgent::new();
+                                let samples = &mut Default::default();
+                                let player: &mut dyn Agent = &mut HiveModelAgent::new(
+                                    &model_data.name,
+                                    &thread_model,
+                                    samples,
+                                    None,
+                                    false,
+                                );
 
                                 let mut last_iter_failed = false;
                                 while last_iter_failed
@@ -393,22 +419,9 @@ pub fn main() -> Result<(), Box<dyn Error>> {
                                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                                         < hypers::GAMES_PER_AI_SIMULATION
                                 {
-                                    let mut player = PlayerGameData {
-                                        model: &thread_model,
-                                        name: &model_data.name,
-                                        samples: &mut Default::default(),
-                                    };
-
-                                    let mut old_player = PlayerGameData {
-                                        model: &old_model,
-                                        name: "model_old",
-                                        samples: &mut Default::default(),
-                                    };
-
                                     last_iter_failed = false;
                                     let mut game = Game::new();
-                                    match play_game_to_end(&mut game, &mut player, &mut old_player)
-                                    {
+                                    match play_game_to_end(&mut game, player, &mut random_agent) {
                                         Ok(None) => {
                                             drawn
                                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -471,12 +484,10 @@ pub fn main() -> Result<(), Box<dyn Error>> {
 
 fn play_game_to_end<'a>(
     g: &mut Game,
-    white_player: &'a mut PlayerGameData<'a>,
-    black_player: &'a mut PlayerGameData<'a>,
+    white_player: &'a mut dyn Agent,
+    black_player: &'a mut dyn Agent,
 ) -> hive_engine::Result<Option<Color>> {
     let mut consecutive_passes = 0;
-    let mut valid_moves = Vec::new();
-    let mut invalid_moves_mask = vec![true; hypers::OUTPUT_LENGTH];
     let mut winner = None;
 
     // Since the model plays pieces relative to other pieces, it doesn't know how to make
@@ -490,20 +501,24 @@ fn play_game_to_end<'a>(
         position: Position(16, 16),
     })?;
 
-    let mut is_first_move = ColorMap::new(true, true);
+    white_player.set_color(Color::White);
+    black_player.set_color(Color::Black);
 
     loop {
-        let (player, opponent) = if g.to_play() == Color::White {
-            (&mut *white_player, &mut *black_player)
+        let player: &mut dyn Agent;
+        let opponent: &mut dyn Agent;
+
+        if g.to_play() == Color::White {
+            player = &mut *white_player;
+            opponent = &mut *black_player;
         } else {
-            (&mut *black_player, &mut *white_player)
+            player = &mut *black_player;
+            opponent = &mut *white_player;
         };
 
         if g.turn() == hypers::MAX_TURNS_PER_GAME {
             break;
         }
-
-        let device = player.model.device;
 
         if let Some(result) = g.is_game_is_over() {
             if let GameWinner::Winner(color) = result {
@@ -513,99 +528,23 @@ fn play_game_to_end<'a>(
             break;
         }
 
-        valid_moves.clear();
-        invalid_moves_mask.fill(true);
-
-        let playing = g.to_play();
-
-        g.load_all_potential_moves(&mut valid_moves)?;
-
-        if valid_moves.is_empty() {
-            metrics::increment_move_made(Move::Pass, playing, player.name, opponent.name);
-
-            g.make_move(Move::Pass)?;
+        let mv = player.select_move(g)?;
+        if mv == Move::Pass {
             consecutive_passes += 1;
             if consecutive_passes >= 6 {
                 break;
             }
-
-            continue;
         } else {
             consecutive_passes = 0;
         }
 
-        let curr_state = translate_game_to_conv_tensor(&g, playing);
-        let curr_state_batch = curr_state.unsqueeze(0).to(device);
-
-        // let map = translate_to_valid_moves_mask(&g, &valid_moves, playing, &mut invalid_moves_mask);
-        let map = translate_to_valid_moves_mask(&g, &valid_moves, playing, &mut invalid_moves_mask);
-        let invalid_moves_tensor = Tensor::from_slice(&invalid_moves_mask);
-
-        let Prediction {
-            value,
-            mut policy,
-            intrinsic_value,
-        } = tch::no_grad(|| player.model.predict(&curr_state_batch));
-
-        let novelty = tch::no_grad(|| player.model.novelty(&curr_state_batch));
-
-        let _ = policy.masked_fill_(&invalid_moves_tensor.to(device), f64::NEG_INFINITY);
-
-        let sampled_action_idx = policy.softmax(-1, None).multinomial(1, true);
-        let action_prob: i64 = i64::try_from(&sampled_action_idx).expect("cast");
-        let mv = map.get(&(action_prob as usize)).expect("populated above.");
-
-        player.samples.game_state.push(curr_state);
-        player.samples.invalid_move_mask.push(invalid_moves_tensor);
-        player
-            .samples
-            .value
-            .push(value.view(1i64).to(tch::Device::Cpu));
-
-        player
-            .samples
-            .selected_policy
-            .push(sampled_action_idx.view(1i64).to(tch::Device::Cpu));
-
-        player
-            .samples
-            .intrinsic_value
-            .push(intrinsic_value.view(1i64).to(tch::Device::Cpu));
-
-        // if (g.turn() > 1 && playing == Color::White) || (g.turn() > 0 && playing == Color::Black) {
-        let is_first_move = is_first_move.get_mut(playing);
-        if *is_first_move {
-            *is_first_move = false;
-        } else {
-            player
-                .samples
-                .novelty
-                .push(novelty.view(1i64).to(tch::Device::Cpu));
-        }
-
-        g.make_move(*mv)?;
-        metrics::increment_move_made(*mv, playing, player.name, opponent.name);
+        let playing = g.to_play();
+        metrics::increment_move_made(mv, playing, player.name(), opponent.name());
+        g.make_move(mv)?;
     }
 
-    // Calculate the novely of the final board state for reach player.
-    for player in [Color::White, Color::Black] {
-        let player_data = if player == Color::White {
-            &mut *white_player
-        } else {
-            &mut *black_player
-        };
-
-        let gw = translate_game_to_conv_tensor(&g, player);
-        let gw_batch = gw.unsqueeze(0).to(player_data.model.device);
-        let final_novelty = tch::no_grad(|| player_data.model.novelty(&gw_batch));
-
-        player_data
-            .samples
-            .novelty
-            .push(final_novelty.view(1).to(tch::Device::Cpu));
-
-        assert!(player_data.samples.validate_buffers());
-    }
+    white_player.observe_final_state(g);
+    black_player.observe_final_state(g);
 
     if g.turn() == hypers::MAX_TURNS_PER_GAME {
         return Err(HiveError::TurnLimitHit);
@@ -658,6 +597,10 @@ fn _train_policy_phase(
 
         for start in (0..frames.len()).step_by(hypers::BATCH_SIZE) {
             adam.zero_grad();
+            if frames.len() < start + hypers::BATCH_SIZE {
+                continue;
+            }
+
             let upper = frames.len().min(start + hypers::BATCH_SIZE) as i64;
             let idxs = perms.i((start as i64)..upper);
 
@@ -688,6 +631,8 @@ fn _train_policy_phase(
             assert!(!intrinsic_adv.requires_grad());
             let intrinsic_adv =
                 (&intrinsic_adv - intrinsic_adv.mean(None)) / (intrinsic_adv.std(false) + 1e-8);
+
+            let intrinsic_adv = intrinsic_adv.clip(-1.0, 1.0);
 
             let adv = adv + hypers::INTRINSIC_ADV_SCALING * intrinsic_adv;
 

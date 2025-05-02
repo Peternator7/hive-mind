@@ -148,6 +148,58 @@ pub fn increment_games_finished(
     );
 }
 
+pub fn increment_novel_position(model_color: Color, model_name: &str) {
+    static METRIC: OnceLock<Counter<u64>> = OnceLock::new();
+
+    let metric = METRIC.get_or_init(|| {
+        let meter = opentelemetry::global::meter_with_scope(scope().clone());
+
+        meter
+            .u64_counter("new_positions_found_total")
+            .with_description("a counter for every novel position found.")
+            .build()
+    });
+
+    let color = match model_color {
+        Color::Black => "black",
+        Color::White => "white",
+    };
+
+    metric.add(
+        1,
+        &[
+            KeyValue::new("model_color", color),
+            KeyValue::new("model_name", model_name.to_string()),
+        ],
+    );
+}
+
+pub fn increment_seen_position(model_color: Color, model_name: &str) {
+    static METRIC: OnceLock<Counter<u64>> = OnceLock::new();
+
+    let metric = METRIC.get_or_init(|| {
+        let meter = opentelemetry::global::meter_with_scope(scope().clone());
+
+        meter
+            .u64_counter("repeat_positions_seen_total")
+            .with_description("a counter for every position seen that has been seen before.")
+            .build()
+    });
+
+    let color = match model_color {
+        Color::Black => "black",
+        Color::White => "white",
+    };
+
+    metric.add(
+        1,
+        &[
+            KeyValue::new("model_color", color),
+            KeyValue::new("model_name", model_name.to_string()),
+        ],
+    );
+}
+
 pub fn increment_move_made(mv: Move, model_color: Color, model_name: &str, opponent_name: &str) {
     static METRIC: OnceLock<Counter<u64>> = OnceLock::new();
 

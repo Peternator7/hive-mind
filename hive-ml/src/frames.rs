@@ -153,7 +153,7 @@ impl MultipleGames {
             }
 
             // Calculate the intrinsic rewards.
-            let rewards_intrinsic = other.novelty[idx].copy();
+            let rewards_intrinsic = other.novelty[idx].copy() - hypers::PENALTY_FOR_MOVING;
             let delta = intrinsic_gamma * &values_intrinsic[idx + 1] + &rewards_intrinsic
                 - &values_intrinsic[idx];
 
@@ -164,7 +164,7 @@ impl MultipleGames {
             td_value_intrinsic = rewards_intrinsic + td_value_intrinsic * intrinsic_gamma;
 
             // Calculate the external rewards.
-            let curr_step_rewards = -hypers::PENALTY_FOR_MOVING;
+            let curr_step_rewards = 0.0;
             let delta =
                 gamma * &values_external[idx + 1] + curr_step_rewards - &values_external[idx];
 

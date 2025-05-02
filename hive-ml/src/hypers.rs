@@ -37,9 +37,6 @@ pub const MAX_FRAMES_PER_GAME: usize = 60;
 pub const MIN_FRAMES_PER_GAME: usize = 30;
 pub const TARGET_FRAME_PERCENTAGE: f64 = 0.50;
 
-/// Max number of iters we'll do on a single batch of data.
-pub const TRAIN_ITERS_PER_BATCH: usize = 2;
-
 /// The minibatch size for training.
 pub const BATCH_SIZE: usize = 2048;
 
@@ -62,15 +59,13 @@ pub const PENALTY_FOR_TIMING_OUT: f64 = 0.50;
 pub const APPROXIMATE_TURN_MEMORY: usize = 100;
 pub const GAMMA: f64 = 1.0 - (1.0 / APPROXIMATE_TURN_MEMORY as f64);
 pub const LAMBDA: f64 = 0.90;
-pub const GRAD_CLIP: f64 = 0.50;
+pub const GRAD_CLIP: f64 = 0.20;
 pub const INTRINSIC_ADV_SCALING: f64 = 0.10;
 
 pub const MAX_SEQ_LENGTH: i64 = 2 * 11;
 
-pub const STEP_BY_INGESTING_GAME: usize = 2;
-
 pub const POLICY_PHASE_TRAIN_ITERS: usize = 2;
-pub const AUXILIARY_PHASE_TRAIN_ITERS: usize = 10;
-pub const AUXILIARY_PHASE_TRAIN_FREQUENCY: usize = 8;
+pub const AUXILIARY_PHASE_TRAIN_ITERS: usize = 8;
+pub const AUXILIARY_PHASE_TRAIN_FREQUENCY: usize = 6;
 pub const AUXILIARY_VALUE_SCALE: f64 = 1.0;
 pub const AUXILIARY_BETA_CLONE: f64 = 0.10;
